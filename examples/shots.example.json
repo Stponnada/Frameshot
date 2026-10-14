@@ -1,0 +1,39 @@
+{
+  "model": "../models/product.glb",
+  "frame": "landscape",
+  "background": "#000",
+  "output": { "dir": "../frameshot-out", "videoName": "ad.mp4", "longEdge": 1920, "stillScale": 1 },
+  "views": [
+    {
+      "caption": "Reveal",
+      "orbit": { "azimuth": 0, "elevation": 8, "distance": 16 },
+      "light": { "exposure": 0.9, "keyIntensity": 5, "keyAzimuth": 150, "keyElevation": 40, "rimIntensity": 3, "ambient": 0.05 },
+      "title": { "left": "Meet", "right": "the", "bottom": "Product" },
+      "hold": 2.5
+    },
+    {
+      "caption": "Profile",
+      "orbit": { "azimuth": 90, "elevation": 5, "distance": 22 },
+      "light": { "exposure": 1.4, "keyIntensity": 3, "keyAzimuth": -80, "keyElevation": 45, "rimIntensity": 1, "ambient": 0.3 },
+      "title": { "statementTop": "Lighter than it looks.", "statementBottom": "Stronger than it needs to be." },
+      "move": 1.2,
+      "hold": 3
+    },
+    {
+      "caption": "Detail",
+      "orbit": { "azimuth": 35, "elevation": 30, "distance": 10 },
+      "light": { "exposure": 1.1, "keyIntensity": 6, "keyAzimuth": 60, "keyElevation": 70, "rimIntensity": 4, "ambient": 0.1 },
+      "title": { "statement": "Every edge is machined, not moulded." },
+      "move": 1,
+      "hold": 3
+    },
+    {
+      "caption": "Close",
+      "orbit": { "azimuth": 200, "elevation": 20, "distance": 20 },
+      "light": { "exposure": 1, "keyIntensity": 1.5, "keyAzimuth": 50, "keyElevation": 15, "rimIntensity": 5, "ambient": 0.1 },
+      "title": { "statementLeft": "Product", "statementRight": "Available now" },
+      "move": 1.5,
+      "hold": 3.5
+    }
+  ]
+}

@@ -1178,11 +1178,9 @@
         else loaderEl.classList.add('idle');
         const e = describeParseError(err, name, ctx);
         if (ctx.restored) forgetLastModel(); // don't retry a broken file on every reload
-        showReport({
-          kind: 'error', ...e, facts: ctx.facts, raw: e.cause ? String(e.cause.message || e.cause) : '',
-          label: ctx.restored ? 'Couldn’t reopen your last model' : undefined,
-        });
-        return;
+        const error = { title: e.title, body: e.body, fix: e.fix, facts: ctx.facts, raw: e.cause ? String(e.cause.message || e.cause) : '' };
+        showReport({ kind: 'error', ...error, label: ctx.restored ? 'Couldn’t reopen your last model' : undefined });
+        return { ok: false, error };
       }
 
       if (model) disposeModel(model);
@@ -1213,7 +1211,9 @@
 
       // Loaded, but some textures or other files didn't come through.
       const failed = [...new Set(ctx.failedUrls.map(baseName))].filter((f) => !/draco|basis/i.test(f));
+      const warnings = [];
       if (failed.length) {
+        warnings.push(`Missing file${failed.length > 1 ? 's' : ''}: ${failed.join(', ')}. Some surfaces may be untextured.`);
         showReport({
           kind: 'warning',
           title: `${quoted(name)} loaded, but ${failed.length} file${failed.length > 1 ? 's' : ''} couldn’t be found`,
@@ -1228,7 +1228,7 @@
       // Render a settled frame before starting the first move so shader
       // setup never competes with the opening camera animation.
       renderer.compile(scene, camera);
-      requestAnimationFrame(() => {
+      await new Promise((resolve) => requestAnimationFrame(() => {
         renderer.render(scene, camera);
         requestAnimationFrame(() => {
           loaderEl.classList.add('hidden');
@@ -1236,8 +1236,42 @@
           renderTextSlots();
           syncLightSliders();
           if (states.length > 0) goToState(0);
+          resolve();
         });
+      }));
+      return { ok: true, model: describeModel(), warnings };
+    }
+
+    // What an agent needs to plan shots: size, centre and useful distances
+    // in world units, plus the mesh and material names.
+    function describeModel() {
+      if (!model) return null;
+      let meshes = 0, triangles = 0;
+      const meshNames = new Set();
+      const materialNames = new Set();
+      model.traverse((o) => {
+        if (!o.isMesh) return;
+        meshes++;
+        if (o.name) meshNames.add(o.name);
+        forEachMaterial(o, (m) => { if (m.name) materialNames.add(m.name); });
+        const g = o.geometry;
+        triangles += (g.index ? g.index.count : g.attributes.position.count) / 3;
       });
+      const d = modelInfo.fitDist;
+      const sz = modelInfo.size;
+      return {
+        name: modelName,
+        size: [round(sz.x), round(sz.y), round(sz.z)],
+        center: [0, round(modelInfo.midY), 0],
+        distances: { closeUp: round(d * 0.8), medium: round(d * 1.3), wide: round(d * 1.8) },
+        meshes,
+        triangles: Math.round(triangles),
+        meshNames: [...meshNames].slice(0, 40),
+        materialNames: [...materialNames].slice(0, 40),
+        coordinates: `Y is up. The model is centred on X and Z and rests on the ground (y = 0). Its longest side is scaled to ${MODEL_SIZE} units. `
+          + 'Orbit azimuth 0 looks at the model from +Z (the front, for glTF models), 90 from its right (+X), 180 from behind, -90 from its left. '
+          + 'Elevation 0 is level, positive looks down from above. Distances assume a landscape frame; tall frames need about 1.5× more.',
+      };
     }
 
     function forEachMaterial(mesh, fn) {
@@ -1283,7 +1317,7 @@
           body: `You ${how}: ${listOf(names.slice(0, 6))}${names.length > 6 ? ` and ${names.length - 6} more` : ''}.`,
           fix: hint || 'Supported formats: .glb, .gltf (with its .bin and textures), .obj, .stl and .fbx. Convert other formats to .glb first. Blender can import most formats and export glTF.',
         });
-        return;
+        return Promise.resolve({ ok: false, error: { title: 'No supported model file', body: `Files: ${names.join(', ')}`, fix: hint || 'Use .glb, .gltf, .obj, .stl or .fbx.' } });
       }
       const blobs = new Map(files.map((f) => [f.name, URL.createObjectURL(f)]));
       const manager = new THREE.LoadingManager();
@@ -1291,7 +1325,7 @@
         if (url.startsWith('blob:') || url.startsWith('data:') || url.startsWith('http')) return url;
         return blobs.get(baseName(url)) || url;
       });
-      loadModel(blobs.get(main.name), main.name, manager, { local: true, blobs, size: main.size, files, restored: how === 'restored' })
+      return loadModel(blobs.get(main.name), main.name, manager, { local: true, blobs, size: main.size, files, restored: how === 'restored' })
         .finally(() => setTimeout(() => blobs.forEach((u) => URL.revokeObjectURL(u)), 1000));
     }
 
@@ -1450,6 +1484,38 @@
       confirmReplace(() => loadFiles(files, 'dropped'), 'Open ' + (files.find((f) => MODEL_EXTS.includes(extOf(f.name)))?.name || 'files'));
     });
 
+    // Facts about the loaded model in world units, set by frameModel().
+    const modelInfo = { size: new THREE.Vector3(), midY: 0, fitDist: 1 };
+
+    // Camera pose from angles around a target. azimuth 0 = in front of the
+    // model on +Z (glTF's forward), 90 = its right side (+X), 180 = behind;
+    // elevation 0 = level, 90 = straight down. distance is in world units
+    // (the model's longest side is MODEL_SIZE).
+    function orbitToPose(o = {}) {
+      const target = o.target || [0, modelInfo.midY, 0];
+      const az = (o.azimuth ?? 0) * DEG2RAD;
+      const el = (o.elevation ?? 15) * DEG2RAD;
+      const d = o.distance ?? modelInfo.fitDist * 1.6;
+      return {
+        pos: [
+          round(target[0] + d * Math.cos(el) * Math.sin(az)),
+          round(target[1] + d * Math.sin(el)),
+          round(target[2] + d * Math.cos(el) * Math.cos(az)),
+        ],
+        target: target.map(round),
+      };
+    }
+    function poseToOrbit(pos, target) {
+      const v = new THREE.Vector3(pos[0] - target[0], pos[1] - target[1], pos[2] - target[2]);
+      const d = v.length() || 1e-9;
+      return {
+        azimuth: round(Math.atan2(v.x, v.z) / DEG2RAD),
+        elevation: round(Math.asin(Math.max(-1, Math.min(1, v.y / d))) / DEG2RAD),
+        distance: round(d),
+        target: target.map(round),
+      };
+    }
+
     // Center the model, drop it onto the ground, frame the camera.
     function frameModel(obj) {
       let box = new THREE.Box3().setFromObject(obj);
@@ -1471,6 +1537,9 @@
       const dist = fitDist * 1.6;
 
       const midY = size.y * 0.5;
+      modelInfo.size.copy(size);
+      modelInfo.midY = midY;
+      modelInfo.fitDist = fitDist;
       controls.target.set(0, midY, 0);
       camera.position.set(dist * 0.7, midY + maxDim * 0.35, dist);
 
@@ -1503,12 +1572,17 @@
     // ============================================================
     //  Camera tween to an arbitrary view
     // ============================================================
+    // Default camera move between views, in seconds (a view's `move` overrides).
+    const DEFAULT_MOVE_S = 1 / 0.025 / 60; // the original 40 frames at 60 fps
     let tween = null;
+    let arrivalWaiters = []; // resolved when the current move finishes
     function isTweening() { return tween !== null; }
 
-    function tweenTo(pos, target, light) {
+    function tweenTo(pos, target, light, seconds = DEFAULT_MOVE_S) {
       tween = {
         t: 0,
+        start: performance.now(),
+        dur: seconds,
         fromPos: camera.position.clone(),
         fromTarget: controls.target.clone(),
         toPos: pos.clone(),
@@ -1546,9 +1620,11 @@
     // override when the frame is portrait-shaped.
     function resolveView(s) {
       const pv = (isPortrait() && s.portrait) ? s.portrait : null;
+      const poseOf = (v) => (v.pos && v.target) ? { pos: v.pos, target: v.target } : v.orbit ? orbitToPose(v.orbit) : null;
+      const pose = (pv && poseOf(pv)) || poseOf(s) || orbitToPose();
       return {
-        pos: (pv && pv.pos) || s.pos,
-        target: (pv && pv.target) || s.target,
+        pos: pose.pos,
+        target: pose.target,
         light: (pv && pv.light) ? { ...lightForState(s), ...pv.light } : lightForState(s),
         title: (pv && pv.title) ? pv.title : s.title,
         titlePos: (pv && pv.titlePos) ? pv.titlePos : s.titlePos,
@@ -1851,7 +1927,7 @@
       });
     }
 
-    function goToState(i) {
+    function goToState(i, { instant = false } = {}) {
       if (exporting) return;
       if (i < 0 || i >= states.length) return;
       const s = states[i];
@@ -1863,7 +1939,8 @@
       tweenTo(
         new THREE.Vector3(v.pos[0], v.pos[1], v.pos[2]),
         new THREE.Vector3(v.target[0], v.target[1], v.target[2]),
-        v.light
+        v.light,
+        instant ? 0 : (s.move ?? DEFAULT_MOVE_S)
       );
       playSfx(AUDIO_SRC.whoosh, 0.5);
       renderSequence();
@@ -1911,6 +1988,8 @@
     let playing = false;
     let playTimer = null;
     let playIdx = 0;
+    let playWaiters = []; // resolved when Play stops
+    function holdSeconds(s) { return s && s.hold != null ? s.hold : PLAY_DWELL_MS / 1000; }
 
     function startPlay() {
       if (states.length === 0) return;
@@ -1935,7 +2014,7 @@
         playIdx++;
         if (playIdx >= states.length) { stopPlay(); return; }
         playStep();
-      }, PLAY_DWELL_MS);
+      }, holdSeconds(states[playIdx]) * 1000);
     }
     function stopPlay() {
       if (!playing) return;
@@ -1944,6 +2023,9 @@
       stopBed();
       btnPlay.classList.remove('active');
       btnPlay.textContent = 'Play';
+      const waiters = playWaiters;
+      playWaiters = [];
+      waiters.forEach((f) => f());
     }
 
     // ============================================================
@@ -2038,6 +2120,39 @@
       showToast('Views cleared');
     });
 
+    // Returns a sentence describing the first problem, or null if valid.
+    function viewsProblem(views) {
+      if (!Array.isArray(views)) return 'Expected a list (array) of views.';
+      const vec3 = (a) => Array.isArray(a) && a.length === 3 && a.every(Number.isFinite);
+      for (let i = 0; i < views.length; i++) {
+        const v = views[i];
+        const at = `View ${i + 1} of ${views.length}`;
+        if (!v || typeof v !== 'object') return `${at} isn’t an object.`;
+        if (!(vec3(v.pos) && vec3(v.target)) && !(v.orbit && typeof v.orbit === 'object')) {
+          return `${at} has no camera. Give it “pos” and “target” (three numbers each), or an “orbit” object.`;
+        }
+        if (v.orbit) {
+          for (const k of ['azimuth', 'elevation', 'distance']) {
+            if (v.orbit[k] != null && !Number.isFinite(v.orbit[k])) return `${at}: orbit.${k} must be a number.`;
+          }
+          if (v.orbit.target != null && !vec3(v.orbit.target)) return `${at}: orbit.target must be three numbers.`;
+        }
+        if (v.title != null) {
+          if (typeof v.title !== 'object') return `${at}: “title” must be an object of caption positions.`;
+          const bad = Object.keys(v.title).filter((k) => !OV_KEYS.includes(k));
+          if (bad.length) return `${at} uses unknown caption position${bad.length > 1 ? 's' : ''} ${bad.join(', ')}. Valid positions: ${OV_KEYS.join(', ')}.`;
+        }
+        if (v.light != null) {
+          const bad = Object.keys(v.light).filter((k) => !LIGHT_KEYS.includes(k) || !Number.isFinite(v.light[k]));
+          if (bad.length) return `${at} has invalid light setting${bad.length > 1 ? 's' : ''} ${bad.join(', ')}. Valid settings (numbers): ${LIGHT_KEYS.join(', ')}.`;
+        }
+        for (const k of ['hold', 'move']) {
+          if (v[k] != null && !(Number.isFinite(v[k]) && v[k] >= 0)) return `${at}: “${k}” must be a number of seconds, 0 or more.`;
+        }
+      }
+      return null;
+    }
+
     const fileJson = document.getElementById('file-json');
     document.getElementById('ap-import').addEventListener('click', () => {
       if (!modelName) { showToast('Load a model first'); return; }
@@ -2065,10 +2180,9 @@
           'Use a file saved with Export in Author mode.');
         return;
       }
-      const bad = data.findIndex((v) => !v || !Array.isArray(v.pos) || v.pos.length !== 3 || !Array.isArray(v.target) || v.target.length !== 3);
-      if (bad >= 0) {
-        fail(`View ${bad + 1} of ${data.length} is missing its camera position or target (each needs “pos” and “target” as three numbers).`,
-          'Re-export the views, or fix that entry by hand.');
+      const problem = viewsProblem(data);
+      if (problem) {
+        fail(problem, 'Re-export the views, or fix that entry by hand.');
         return;
       }
       states = data;
@@ -2153,8 +2267,8 @@
     });
 
     // ============================================================
-    //  Frame shot — PNG of the current render, transparent background.
-    //  (HTML titles/captions are overlays and are not included.)
+    //  Frame shot — PNG of the current render. The button saves a
+    //  transparent PNG without captions; the API can include them.
     // ============================================================
     function fileStem() {
       return (modelName || 'frame').replace(/\.[^.]+$/, '').replace(/[^\w.-]+/g, '_');
@@ -2167,20 +2281,39 @@
       setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     }
 
-    document.getElementById('btn-shot').addEventListener('click', () => {
-      if (!model) { showToast('Load a model first'); return; }
+    // Render the current camera to a PNG. captions: draw the active view's
+    // caption overlays, fully shown. background: a CSS colour or 'transparent'.
+    async function renderImage({ captions = false, scale = SHOT_PIXEL_RATIO, background = 'transparent' } = {}) {
+      const w = Math.round(renderW() * scale);
+      const h = Math.round(renderH() * scale);
+      const slots = captions && activeIndex >= 0 ? measureCaptions(resolveView(states[activeIndex])) : null;
+      const comp = document.createElement('canvas');
+      comp.width = w;
+      comp.height = h;
+      const ctx = comp.getContext('2d');
+      if (background !== 'transparent') { ctx.fillStyle = background; ctx.fillRect(0, 0, w, h); }
       const prev = renderer.getPixelRatio();
-      renderer.setPixelRatio(SHOT_PIXEL_RATIO);
+      renderer.setPixelRatio(scale);
       renderer.setSize(renderW(), renderH(), false);
-      renderer.render(scene, camera);
-      // toBlob must run in the same task as render (no preserveDrawingBuffer)
-      const view = activeIndex >= 0 ? `-v${activeIndex + 1}` : '';
-      const name = `${fileStem()}${view}-${renderW() * SHOT_PIXEL_RATIO}x${renderH() * SHOT_PIXEL_RATIO}.png`;
-      renderer.domElement.toBlob((blob) => {
-        if (blob) { downloadBlob(blob, name); showToast('Saved ' + name); }
-      }, 'image/png');
+      drawCaptions(ctx, slots, 1, false, scale);
+      renderer.render(scene, camera); // drawn in the same task: no preserveDrawingBuffer needed
+      ctx.drawImage(renderer.domElement, 0, 0, w, h);
+      drawCaptions(ctx, slots, 1, true, scale);
       renderer.setPixelRatio(prev);
       renderer.setSize(renderW(), renderH(), false);
+      const blob = await new Promise((resolve) => comp.toBlob(resolve, 'image/png'));
+      return { blob, width: w, height: h };
+    }
+    function imageFileName(w, h) {
+      return `${fileStem()}${activeIndex >= 0 ? `-v${activeIndex + 1}` : ''}-${w}x${h}.png`;
+    }
+
+    document.getElementById('btn-shot').addEventListener('click', async () => {
+      if (!model) { showToast('Load a model first'); return; }
+      const { blob, width, height } = await renderImage();
+      const name = imageFileName(width, height);
+      downloadBlob(blob, name);
+      showToast('Saved ' + name);
     });
 
     // ============================================================
@@ -2307,7 +2440,6 @@
     const VIDEO_FPS = 30;
     const VIDEO_LONG_EDGE = 1920;
     const VIDEO_BITRATE = 12_000_000;
-    const MOVE_S = 1 / 0.025 / 60;   // the live tween: 40 steps at 60 fps
     const REVEAL_S = 0.7;            // --t-reveal
     const MP4_MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.5/+esm';
     let exporting = false;
@@ -2325,6 +2457,7 @@
     function measureCaptions(rv) {
       const stageRect = stageEl.getBoundingClientRect();
       const slots = [];
+      const before = OV_KEYS.map((k) => [ovSlots[k], ovSlots[k].textContent, ovSlots[k].className, ovSlots[k].style.cssText]);
       document.body.classList.add('measuring');
       applyTitlePositions(rv.titlePos || {});
       for (const k of OV_KEYS) {
@@ -2369,9 +2502,13 @@
             cy: l.top + l.height / 2 - stageRect.top,
           })),
         });
-        el.classList.remove('visible');
-        el.textContent = '';
       }
+      for (const [el, text, cls, css] of before) {
+        el.textContent = text;
+        el.className = cls;
+        el.style.cssText = css;
+      }
+      void stageEl.offsetWidth; // apply the restore before transitions return
       document.body.classList.remove('measuring');
       return slots;
     }
@@ -2406,10 +2543,10 @@
       let t = 0;
       states.forEach((s, i) => {
         const rv = resolveView(s);
-        const move = i === 0 ? 0 : MOVE_S;
+        const move = i === 0 ? 0 : (s.move ?? DEFAULT_MOVE_S);
         segs.push({
           i, rv, start: t, move,
-          end: t + move + PLAY_DWELL_MS / 1000,
+          end: t + move + holdSeconds(s),
           pos: new THREE.Vector3(...rv.pos),
           target: new THREE.Vector3(...rv.target),
           light: rv.light,
@@ -2447,70 +2584,81 @@
         Views: String(states.length),
         Size: `${w} × ${h}`,
         Length: `${seconds.toFixed(1)} s (${frames} frames at ${VIDEO_FPS} fps)`,
-        Format: 'MP4, H.264, no audio',
+        Format: 'MP4, no audio',
       };
     }
 
+    // H.264 first (plays everywhere). Browsers without it (e.g. open-source
+    // Chromium builds) fall back to VP9 or AV1, still in an MP4 file.
+    const VIDEO_CODECS = [
+      { codec: 'avc1.640033', mux: 'avc', label: 'H.264' },
+      { codec: 'avc1.4d0033', mux: 'avc', label: 'H.264' },
+      { codec: 'avc1.42003e', mux: 'avc', label: 'H.264' },
+      { codec: 'vp09.00.40.08', mux: 'vp9', label: 'VP9' },
+      { codec: 'av01.0.08M.08', mux: 'av1', label: 'AV1' },
+    ];
     async function pickVideoCodec(w, h) {
       if (typeof VideoEncoder === 'undefined') return null;
-      for (const codec of ['avc1.640033', 'avc1.4d0033', 'avc1.42003e']) {
-        const cfg = { codec, width: w, height: h, bitrate: VIDEO_BITRATE, framerate: VIDEO_FPS };
+      for (const c of VIDEO_CODECS) {
+        const cfg = { codec: c.codec, width: w, height: h, bitrate: VIDEO_BITRATE, framerate: VIDEO_FPS };
         try {
           const { supported } = await VideoEncoder.isConfigSupported(cfg);
-          if (supported) return cfg;
-        } catch (e) { /* try the next profile */ }
+          if (supported) return { cfg, mux: c.mux, label: c.label };
+        } catch (e) { /* try the next codec */ }
       }
       return null;
     }
 
-    async function exportVideo() {
-      if (exporting) return;
-      if (!model) return;
+    // Returns { ok: true, fileName, width, height, frames, seconds, codec, bytes, blob }
+    // or { ok: false, error } (and shows the error in the report panel).
+    async function exportVideo({ download = true, fileName: wantedName, longEdge = VIDEO_LONG_EDGE } = {}) {
+      const fail = ({ primary, ...error }) => {
+        showReport({ kind: 'error', label: 'Couldn’t export video', offerOpen: false, primary, ...error });
+        return { ok: false, error };
+      };
+      if (exporting) return { ok: false, error: { title: 'A video export is already running' } };
+      if (!model) return fail({ title: 'No model is open', body: 'Open a model and capture some views first.' });
       if (states.length === 0) {
-        showReport({
-          kind: 'error', label: 'Couldn’t export video', offerOpen: false,
+        return fail({
           title: 'There’s no sequence to export yet',
           body: `Export video plays your captured views in order, like Play. ${quoted(modelName)} has no views yet.`,
           fix: 'Open Author, frame the model and press Capture new for each shot, then export again.',
           primary: { text: 'Open Author', run: () => { if (!document.body.classList.contains('authoring')) btnAuthor.click(); } },
         });
-        return;
       }
 
       // Output keeps the stage's shape (landscape, portrait or phone frame).
       const aspect = renderW() / renderH();
       const even = (n) => Math.max(2, Math.round(n / 2) * 2);
-      const outW = aspect >= 1 ? VIDEO_LONG_EDGE : even(VIDEO_LONG_EDGE * aspect);
-      const outH = aspect >= 1 ? even(VIDEO_LONG_EDGE / aspect) : VIDEO_LONG_EDGE;
+      const edge = even(longEdge);
+      const outW = aspect >= 1 ? edge : even(edge * aspect);
+      const outH = aspect >= 1 ? even(edge / aspect) : edge;
 
-      const config = await pickVideoCodec(outW, outH);
-      if (!config) {
-        showReport({
-          kind: 'error', label: 'Couldn’t export video', offerOpen: false,
+      const picked = await pickVideoCodec(outW, outH);
+      if (!picked) {
+        return fail({
           title: typeof VideoEncoder === 'undefined'
             ? 'This browser can’t encode video'
-            : `This browser can’t encode H.264 at ${outW} × ${outH}`,
+            : `This browser can’t encode video at ${outW} × ${outH}`,
           body: typeof VideoEncoder === 'undefined'
             ? 'Video export uses the WebCodecs API (VideoEncoder), which this browser doesn’t provide.'
-            : 'The browser’s video encoder rejected every H.264 profile tried (High, Main and Baseline) at this size.',
+            : 'The browser’s video encoder rejected every codec tried (H.264 High, Main and Baseline, VP9 and AV1) at this size.',
           fix: 'Use a recent Chrome, Edge or Safari (16.4 or later). If you’re in Phone frame mode, try turning it off to export landscape.',
           facts: { Size: `${outW} × ${outH}`, Browser: navigator.userAgent },
         });
-        return;
       }
+      const config = picked.cfg;
 
       let Muxer, ArrayBufferTarget;
       try {
         ({ Muxer, ArrayBufferTarget } = await import(MP4_MUXER_URL));
       } catch (e) {
-        showReport({
-          kind: 'error', label: 'Couldn’t export video', offerOpen: false,
+        return fail({
           title: 'Couldn’t load the MP4 writer',
           body: 'Video export downloads a small library (mp4-muxer) from cdn.jsdelivr.net to package the frames as MP4, and that download failed.',
           fix: 'Check your internet connection, then try again.',
           raw: String(e && e.message || e),
         });
-        return;
       }
 
       stopPlay();
@@ -2529,8 +2677,8 @@
 
       const timeline = buildTimeline();
       const frames = Math.ceil(timeline.duration * VIDEO_FPS);
-      const facts = exportFacts(outW, outH, frames, timeline.duration);
-      const fileName = `${fileStem()}-sequence-${outW}x${outH}.mp4`;
+      const facts = { ...exportFacts(outW, outH, frames, timeline.duration), Codec: picked.label };
+      const fileName = wantedName || `${fileStem()}-sequence-${outW}x${outH}.mp4`;
       showReport({
         kind: 'progress', label: 'Exporting video', offerOpen: false,
         title: 'Rendering frame 0 of ' + frames, facts, closeText: 'Cancel',
@@ -2543,6 +2691,7 @@
       comp.height = outH;
       const ctx = comp.getContext('2d');
       const scale = outW / renderW();
+      let blob = null;
 
       renderer.setPixelRatio(1);
       renderer.setSize(outW, outH, false);
@@ -2551,7 +2700,7 @@
 
       let encodeError = null;
       const target = new ArrayBufferTarget();
-      const muxer = new Muxer({ target, video: { codec: 'avc', width: outW, height: outH, frameRate: VIDEO_FPS }, fastStart: 'in-memory' });
+      const muxer = new Muxer({ target, video: { codec: picked.mux, width: outW, height: outH, frameRate: VIDEO_FPS }, fastStart: 'in-memory' });
       const encoder = new VideoEncoder({
         output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
         error: (e) => { encodeError = e; },
@@ -2593,27 +2742,34 @@
           await encoder.flush();
           if (encodeError) throw encodeError;
           muxer.finalize();
-          downloadBlob(new Blob([target.buffer], { type: 'video/mp4' }), fileName);
+          blob = new Blob([target.buffer], { type: 'video/mp4' });
+          if (download) downloadBlob(blob, fileName);
         }
         encoder.close();
       } catch (e) {
         console.error('Video export failed:', e);
         try { encoder.close(); } catch (_) { /* already closed */ }
         restoreAfterExport(saved);
-        showReport({
-          kind: 'error', label: 'Couldn’t export video', offerOpen: false,
+        return fail({
           title: 'The video encoder stopped partway through',
           body: 'Frames were being rendered, but the browser’s video encoder reported an error and the file couldn’t be finished.',
           fix: 'Try again. If it keeps failing, close other heavy tabs, or turn off Phone frame to export a standard landscape size.',
           facts: { ...facts, Codec: config.codec },
           raw: String(e && e.message || e),
         });
-        return;
       }
 
       restoreAfterExport(saved);
       hideReport();
-      showToast(exportCancelled ? 'Video export cancelled' : 'Saved ' + fileName);
+      if (exportCancelled) {
+        showToast('Video export cancelled');
+        return { ok: false, cancelled: true, error: { title: 'The export was cancelled' } };
+      }
+      showToast(download ? 'Saved ' + fileName : 'Video rendered');
+      return {
+        ok: true, fileName, width: outW, height: outH, frames,
+        seconds: round(timeline.duration), codec: picked.label, bytes: blob.size, blob,
+      };
     }
 
     function restoreAfterExport(saved) {
@@ -2635,7 +2791,7 @@
       if (activeIndex >= 0) revealOverlays();
     }
 
-    document.getElementById('btn-export-video').addEventListener('click', exportVideo);
+    document.getElementById('btn-export-video').addEventListener('click', () => exportVideo());
 
     // ============================================================
     //  Render loop
@@ -2645,7 +2801,7 @@
       if (exporting) return; // the exporter drives the renderer
 
       if (tween) {
-        tween.t = Math.min(tween.t + 0.025, 1);
+        tween.t = tween.dur > 0 ? Math.min((performance.now() - tween.start) / (tween.dur * 1000), 1) : 1;
         const e = easeInOutCubic(tween.t);
         camera.position.lerpVectors(tween.fromPos, tween.toPos, e);
         controls.target.lerpVectors(tween.fromTarget, tween.toTarget, e);
@@ -2658,6 +2814,9 @@
           if (activeIndex >= 0) revealOverlays();
           syncLightSliders();
           if (playing) scheduleNextPlayStep();
+          const waiters = arrivalWaiters;
+          arrivalWaiters = [];
+          waiters.forEach((f) => f());
         }
       }
 
@@ -2670,22 +2829,310 @@
       return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
     }
 
+    // ============================================================
+    //  Agent API — window.frameshot
+    //  Everything the UI does, as async calls with JSON-friendly
+    //  results, so an LLM agent (or a script) can drive the tool.
+    //  Failures throw a FrameshotError whose message says what went
+    //  wrong and how to fix it. Documented in skill/frameshot/.
+    // ============================================================
+    class FrameshotError extends Error {
+      constructor(error) {
+        const e = typeof error === 'string' ? { title: error } : error;
+        super([e.title, e.body, e.fix && 'Fix: ' + e.fix].filter(Boolean).join(' '));
+        this.name = 'FrameshotError';
+        Object.assign(this, e);
+      }
+    }
+    function needModel() {
+      if (!model) throw new FrameshotError({ title: 'No model is open.', fix: 'Call frameshot.loadModel(url) first.' });
+    }
+    function needView(i) {
+      if (!Number.isInteger(i) || i < 0 || i >= states.length) {
+        throw new FrameshotError({ title: `There’s no view ${i}.`, body: `Views are numbered from 0; this model has ${states.length}.` });
+      }
+    }
+    function checkViews(views) {
+      const problem = viewsProblem(views);
+      if (problem) throw new FrameshotError({ title: 'Invalid views.', body: problem, fix: 'See frameshot.schema for the view format.' });
+    }
+    const nextFrame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    function waitForArrival() {
+      return tween ? new Promise((r) => arrivalWaiters.push(r)) : Promise.resolve();
+    }
+    function blobToDataUrl(blob) {
+      return new Promise((resolve) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.readAsDataURL(blob); });
+    }
+    function refreshViewsUi() {
+      saveStates();
+      renderSequence();
+      renderTextSlots();
+    }
+
+    const VIEW_SCHEMA = {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      title: 'Frameshot view',
+      description: 'One shot in the sequence. Give the camera either as pos + target, or as orbit (pos + target win if both are set).',
+      type: 'object',
+      properties: {
+        caption: { type: 'string', description: 'Name shown in the Views list. Not drawn on screen.' },
+        pos: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3, description: 'Camera position [x, y, z] in world units.' },
+        target: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3, description: 'Point the camera looks at [x, y, z].' },
+        orbit: {
+          type: 'object',
+          description: 'Camera placed by angles around a target.',
+          properties: {
+            azimuth: { type: 'number', description: 'Degrees around the vertical axis. 0 = front (+Z), 90 = right (+X), 180 = back, -90 = left. Default 0.' },
+            elevation: { type: 'number', description: 'Degrees above level. 0 = level, 90 = straight down, negative = from below. Default 15.' },
+            distance: { type: 'number', description: 'World units from the target. See describeModel().distances. Default: a medium shot.' },
+            target: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3, description: 'Default: the model centre.' },
+          },
+        },
+        light: {
+          type: 'object',
+          description: 'Lighting for this view. Omitted keys use the defaults.',
+          properties: {
+            exposure: { type: 'number', minimum: 0.2, maximum: 2.5, description: 'Overall brightness. Default 1.' },
+            keyIntensity: { type: 'number', minimum: 0, maximum: 6, description: 'Main light strength. Default 2.4.' },
+            keyAzimuth: { type: 'number', minimum: -180, maximum: 180, description: 'Main light direction in degrees (same convention as orbit.azimuth). Default 40.' },
+            keyElevation: { type: 'number', minimum: 0, maximum: 90, description: 'Main light height in degrees. Default 46.' },
+            rimIntensity: { type: 'number', minimum: 0, maximum: 5, description: 'Edge light from behind. Default 1.2.' },
+            ambient: { type: 'number', minimum: 0, maximum: 1, description: 'Shadow fill. 0 = deep shadows. Default 0.15.' },
+          },
+        },
+        title: {
+          type: 'object',
+          description: 'Caption overlay text by position. Omit positions you don’t use.',
+          properties: {
+            top: { type: 'string', description: 'Huge hero word(s) above the model.' },
+            bottom: { type: 'string', description: 'Huge hero word(s) below the model.' },
+            left: { type: 'string', description: 'Short words left of centre at mid-height. Behind the model by default.' },
+            right: { type: 'string', description: 'Short words right of centre at mid-height. Behind the model by default.' },
+            statement: { type: 'string', description: 'One sentence along the bottom.' },
+            statementTop: { type: 'string', description: 'First half of a sentence, above the model.' },
+            statementBottom: { type: 'string', description: 'Second half, below the model.' },
+            statementLeft: { type: 'string', description: 'First half of a sentence, left of the model.' },
+            statementRight: { type: 'string', description: 'Second half, right of the model.' },
+          },
+        },
+        titleLayer: { type: 'object', additionalProperties: { type: 'boolean' }, description: 'Per position: true = in front of the model, false = behind it.' },
+        titlePos: {
+          type: 'object',
+          additionalProperties: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } } },
+          description: 'Per position: centre of the text as a percentage of the frame, e.g. { "x": 50, "y": 20 }.',
+        },
+        hold: { type: 'number', minimum: 0, description: 'Seconds to stay on this view after arriving. Default 3.' },
+        move: { type: 'number', minimum: 0, description: 'Seconds for the camera move into this view. 0 = hard cut. Default 0.67. Ignored for the first view.' },
+        portrait: { type: 'object', description: 'Overrides (pos, target, orbit, light, title, titlePos, titleLayer) used when the frame is taller than wide.' },
+      },
+    };
+
+    const HELP = `Frameshot agent API (window.frameshot), version 1. All methods are async unless noted.
+Coordinates: describeModel().coordinates. View format: frameshot.schema.
+
+loadModel(source, { name })   Open a model from a URL, File, Blob or array of Files. Returns describeModel().
+describeModel()               (sync) Size, centre, suggested distances, mesh and material names.
+getViews() / setViews(views)  Read or replace the whole sequence. setViews validates and saves.
+addView(view)                 Append a view. Returns its index.
+updateView(i, patch)          Merge changes into view i.
+removeView(i) / clearViews()
+captureView({ caption, ... }) Append the current camera and lighting as a new view.
+goToView(i, { instant })      Move to view i and wait until it arrives. Returns getCamera().
+setCamera({ pos, target } | { orbit }) / getCamera()
+setLight(partial) / getLight()
+setFrame('landscape' | 'portrait' | 'phone')   Shape of the stage; images and video follow it.
+takeImage({ view, captions = true, background = '#000', scale = 1, download = false, fileName })
+                              PNG of the current or given view. Returns { width, height, dataUrl } (or fileName when downloading).
+play()                        Play the sequence; resolves when it finishes. stop() ends it.
+exportVideo({ download = true, fileName, longEdge = 1920 })
+                              Render the sequence to MP4. Returns { fileName, width, height, frames, seconds, codec, bytes }.
+getState()                    (sync) Model, view count, active view, camera, light, frame.
+Errors throw FrameshotError with a message that says what went wrong and how to fix it.`;
+
+    const frameshot = {
+      version: 1,
+      schema: VIEW_SCHEMA,
+      FrameshotError,
+      help() { return HELP; },
+
+      async loadModel(source, { name } = {}) {
+        let result;
+        if (typeof source === 'string') {
+          result = await loadModel(source, name || baseName(source));
+        } else if (source instanceof Blob || Array.isArray(source)) {
+          const list = (Array.isArray(source) ? source : [source]).map((f) =>
+            f instanceof File ? f : new File([f], name || 'model.glb'));
+          result = await loadFiles(list, 'provided');
+        } else {
+          throw new FrameshotError({ title: 'loadModel needs a URL, File, Blob or array of Files.' });
+        }
+        if (!result || !result.ok) throw new FrameshotError(result ? result.error : 'The model didn’t load.');
+        await waitForArrival();
+        return { ...result.model, warnings: result.warnings };
+      },
+
+      describeModel() { needModel(); return describeModel(); },
+
+      getViews() { return structuredClone(states); },
+      setViews(views) {
+        needModel();
+        checkViews(views);
+        stopPlay();
+        states = structuredClone(views);
+        clearActive();
+        refreshViewsUi();
+        return states.length;
+      },
+      addView(view) {
+        needModel();
+        checkViews([view]);
+        states.push(structuredClone(view));
+        refreshViewsUi();
+        return states.length - 1;
+      },
+      updateView(i, patch) {
+        needModel();
+        needView(i);
+        const next = { ...states[i], ...structuredClone(patch) };
+        // A new orbit replaces an older explicit pose.
+        if (patch.orbit && !patch.pos) { delete next.pos; delete next.target; }
+        checkViews([next]);
+        states[i] = next;
+        refreshViewsUi();
+        return structuredClone(next);
+      },
+      removeView(i) {
+        needModel();
+        needView(i);
+        states.splice(i, 1);
+        clearActive();
+        refreshViewsUi();
+        return states.length;
+      },
+      clearViews() { needModel(); states = []; clearActive(); refreshViewsUi(); return 0; },
+      captureView(extra = {}) {
+        needModel();
+        const v = currentView();
+        const view = { caption: `View ${states.length + 1}`, pos: v.pos, target: v.target, light: { ...liveLight }, ...structuredClone(extra) };
+        checkViews([view]);
+        states.push(view);
+        activeIndex = states.length - 1;
+        refreshViewsUi();
+        return activeIndex;
+      },
+
+      async goToView(i, { instant = false } = {}) {
+        needModel();
+        needView(i);
+        stopPlay();
+        goToState(i, { instant });
+        await waitForArrival();
+        await nextFrame();
+        return frameshot.getCamera();
+      },
+      async setCamera(cam = {}, { instant = true } = {}) {
+        needModel();
+        const pose = cam.orbit ? orbitToPose(cam.orbit) : cam;
+        if (!Array.isArray(pose.pos) || !Array.isArray(pose.target)) {
+          throw new FrameshotError({ title: 'setCamera needs { pos, target } or { orbit }.' });
+        }
+        stopPlay();
+        clearActive();
+        tweenTo(new THREE.Vector3(...pose.pos), new THREE.Vector3(...pose.target), null, instant ? 0 : DEFAULT_MOVE_S);
+        await waitForArrival();
+        await nextFrame();
+        return frameshot.getCamera();
+      },
+      getCamera() {
+        const pos = camera.position.toArray().map(round);
+        const target = controls.target.toArray().map(round);
+        return { pos, target, orbit: poseToOrbit(pos, target) };
+      },
+      setLight(partial = {}) {
+        checkViews([{ orbit: {}, light: partial }]);
+        Object.assign(liveLight, partial);
+        applyLight(liveLight);
+        syncLightSliders();
+        return { ...liveLight };
+      },
+      getLight() { return { ...liveLight }; },
+
+      async setFrame(shape = 'landscape') {
+        if (!['landscape', 'portrait', 'phone'].includes(shape)) {
+          throw new FrameshotError({ title: `Unknown frame “${shape}”.`, fix: 'Use landscape, portrait or phone. For an exact size, resize the browser window instead.' });
+        }
+        const phone = shape !== 'landscape';
+        document.body.classList.toggle('phone', phone);
+        btnPhone.classList.toggle('active', phone);
+        await nextFrame();
+        await nextFrame();
+        return { width: renderW(), height: renderH(), portrait: isPortrait() };
+      },
+
+      async takeImage({ view, captions = true, background = '#000', scale = 1, download = false, fileName } = {}) {
+        needModel();
+        if (view != null) await frameshot.goToView(view, { instant: true });
+        const { blob, width, height } = await renderImage({ captions, scale, background });
+        const name = fileName || imageFileName(width, height);
+        if (download) { downloadBlob(blob, name); return { fileName: name, width, height, bytes: blob.size }; }
+        return { width, height, bytes: blob.size, dataUrl: await blobToDataUrl(blob) };
+      },
+
+      async play() {
+        needModel();
+        if (!states.length) throw new FrameshotError({ title: 'There are no views to play.', fix: 'Add views with addView() or setViews() first.' });
+        const done = new Promise((r) => playWaiters.push(r));
+        startPlay();
+        await done;
+      },
+      stop() { stopPlay(); },
+
+      async exportVideo(opts = {}) {
+        const r = await exportVideo(opts);
+        if (!r.ok) throw new FrameshotError(r.error);
+        const { blob, ok, ...meta } = r;
+        return meta;
+      },
+
+      getState() {
+        return {
+          version: 1,
+          model: modelName,
+          views: states.length,
+          activeView: activeIndex,
+          playing,
+          exporting,
+          frame: { width: renderW(), height: renderH(), portrait: isPortrait(), phone: document.body.classList.contains('phone') },
+          camera: model ? frameshot.getCamera() : null,
+          light: { ...liveLight },
+        };
+      },
+    };
+    window.frameshot = frameshot;
+
     renderSequence();
     tick();
 
     // On start: ?model=path/to/file.glb loads a model served next to this
     // page; otherwise reopen the last model that was opened from disk.
-    const initialModel = new URLSearchParams(location.search).get('model');
+    const params = new URLSearchParams(location.search);
+    const initialModel = params.get('model');
+    let startup;
     if (initialModel) {
-      loadModel(initialModel, baseName(initialModel));
+      startup = loadModel(initialModel, baseName(initialModel));
+    } else if (params.has('fresh')) {
+      startup = Promise.resolve(); // ?fresh: start empty (used by agents and the CLI)
     } else {
       loaderEl.classList.remove('idle');
       loaderPct.textContent = 'Reopening your last model';
-      recallLastModel().then((files) => {
-        if (files) loadFiles(files, 'restored');
-        else loaderEl.classList.add('idle');
+      startup = recallLastModel().then((files) => {
+        if (files) return loadFiles(files, 'restored');
+        loaderEl.classList.add('idle');
       });
     }
+    // frameshot.ready resolves once startup loading has settled, so an
+    // agent's first loadModel() can't race the restore of the last model.
+    frameshot.ready = startup.then(() => true, () => true);
   </script>
 </body>
 </html>

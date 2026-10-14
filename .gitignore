@@ -9,3 +9,7 @@
 # Local tool settings
 .claude/
 .DS_Store
+
+# Dependencies and render output
+node_modules/
+frameshot-out/

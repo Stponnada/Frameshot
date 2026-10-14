@@ -1,0 +1,22 @@
+{
+  "name": "frameshot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Set up camera shots of any 3D model and export them as images or an MP4 video.",
+  "type": "module",
+  "bin": {
+    "frameshot": "tools/frameshot.mjs"
+  },
+  "scripts": {
+    "serve": "python3 -m http.server 8137",
+    "describe": "node tools/frameshot.mjs describe",
+    "stills": "node tools/frameshot.mjs stills",
+    "render": "node tools/frameshot.mjs render"
+  },
+  "dependencies": {
+    "playwright": "1.63.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
