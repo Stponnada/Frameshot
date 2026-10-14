@@ -1,0 +1,2691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Frameshot</title>
+  <style>
+    /* ============================================================
+       TOKENS — every size, space, colour, radius and timing below
+       maps to one of these. A literal value in a rule is a defect.
+       ============================================================ */
+    :root {
+      /* Colour, by role. Secondary text is the text colour at 60%. */
+      --ground: #000;
+      --panel: #121317;          /* one tonal step up from the ground */
+      --raise: #1d1f24;          /* hover / selected rows, inputs on panel */
+      --text: #eceef2;
+      --text-2: rgba(236, 238, 242, 0.6);
+      --line: rgba(236, 238, 242, 0.4); /* UI boundaries (inputs, outlines): ≥ 3:1 */
+      --accent: #4da3ff;         /* interaction only: selection, focus, progress */
+
+      /* One family. Three weights: 400 UI, 500 labels, 700 title overlays. */
+      --font: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      --fs-label: 11px;
+      --fs-ui: 13px;
+      --fs-lead: 17px;
+      --fs-statement: clamp(24px, 3.4cqw, 52px);
+      --fs-hero: clamp(58px, 13.5cqw, 200px);
+
+      /* Spacing scale */
+      --s-1: 4px;
+      --s-2: 8px;
+      --s-3: 12px;
+      --s-4: 16px;
+      --s-5: 24px;
+      --s-6: 32px;
+      --s-7: 48px;
+
+      --radius: 4px;
+
+      /* One easing curve. --t-reveal is content (title overlays), not chrome. */
+      --ease: cubic-bezier(0.2, 0, 0, 1);
+      --t-hover: 0.2s;
+      --t-state: 0.3s;
+      --t-media: 0.4s;
+      --t-reveal: 0.7s;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      overflow: hidden;
+      background: var(--ground);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: var(--fs-ui);
+      font-weight: 400;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    * { scrollbar-width: thin; scrollbar-color: var(--raise) transparent; }
+
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    /* --- Shared text styles --- */
+    .label {
+      font-weight: 500;
+      color: var(--text);     /* section heading */
+    }
+    .label.key { color: var(--text-2); } /* key: names, states */
+
+    /* --- Buttons: text by default, outline for a section's main action,
+           solid for the one primary action on screen (Take an image). --- */
+    .btn {
+      appearance: none;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text-2);
+      font: inherit;
+      font-weight: 500;
+      line-height: 1;
+      padding: var(--s-2) var(--s-3);
+      border-radius: var(--radius);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background var(--t-hover) var(--ease), color var(--t-hover) var(--ease);
+    }
+    .btn:hover { color: var(--text); background: var(--raise); }
+    .btn.active { color: var(--accent); background: var(--raise); }
+    .btn.outline { border-color: var(--line); color: var(--text); }
+    .btn.solid { background: var(--text); color: var(--ground); }
+    .btn.solid:hover { background: #fff; }
+    .btn.small { padding: var(--s-1) var(--s-2); font-size: var(--fs-label); }
+    .btn:disabled { opacity: 0.4; cursor: default; background: transparent; }
+
+    /* Stage: render surface. Full-viewport by default. */
+    .stage {
+      position: fixed;
+      inset: 0;
+      background: var(--ground);
+      isolation: isolate; /* contain the behind-text z-order */
+      overflow: hidden;
+      /* Typography and overlay widths must follow this render surface, not
+         the browser window. This matters when Phone mode is a narrow frame
+         inside a wide desktop authoring window. */
+      container-type: inline-size;
+    }
+    /* Phone mode: centered portrait frame. The frame is honest about the
+       output: shots are rectangles, so it carries the house radius only. */
+    body.phone .stage {
+      inset: auto;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      height: min(860px, 86vh);
+      aspect-ratio: 9 / 19.5;
+      width: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+    }
+
+    #app { position: absolute; inset: 0; z-index: 2; } /* model canvas sits above behind-text (z1) */
+
+    canvas { display: block; touch-action: none; }
+
+    /* --- Header: name + model on the left, model actions on the right --- */
+    .header {
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      padding: var(--s-5) var(--s-6);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      pointer-events: none;
+      z-index: 25;
+    }
+    .header .brand { display: flex; align-items: baseline; gap: var(--s-3); min-width: 0; }
+    .header .app-name { font-size: var(--fs-lead); font-weight: 500; }
+    .header .model-name { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .header .header-actions { display: flex; gap: var(--s-1); pointer-events: auto; }
+    body.no-model .header-actions { display: none; }
+
+    /* --- Control dock --- */
+    .dock {
+      position: absolute;
+      bottom: var(--s-5);
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: var(--s-4); /* groups are separated by space, not rules */
+      padding: var(--s-1);
+      background: var(--panel);
+      border-radius: var(--radius);
+      z-index: 10;
+    }
+    .dock .group { display: flex; gap: var(--s-1); }
+
+    body.no-model .dock,
+    body.no-model .sequence,
+    body.no-model .seq-reopen,
+    body.no-model .author-panel { display: none; }
+
+    /* --- Big-type title overlays (content, not chrome) --- */
+    .ov {
+      position: absolute;
+      pointer-events: none;
+      z-index: 8;
+      color: #fff;
+      font-family: var(--font);
+      font-weight: 700;
+      font-size: var(--fs-statement);
+      letter-spacing: -0.015em;
+      line-height: 1.12;
+      opacity: 0;
+      white-space: nowrap;
+      transition: opacity var(--t-reveal) var(--ease), transform var(--t-reveal) var(--ease);
+      text-shadow: 0 4px 40px rgba(0, 0, 0, 0.55); /* legibility over the model */
+    }
+    .ov.visible { opacity: 1; }
+
+    /* Hero words capping the top / bottom of the model */
+    .ov-top, .ov-bottom {
+      left: 0; right: 0;
+      text-align: center;
+      letter-spacing: -0.03em;
+      font-size: var(--fs-hero);
+      line-height: 0.9;
+    }
+    .ov-top    { top: 8%;     transform: translateY(-16px); }
+    .ov-bottom { bottom: 16%; transform: translateY(16px); }
+    .ov-top.visible, .ov-bottom.visible { transform: translateY(0); }
+
+    /* Side words at mid-height (default layer: behind the model) */
+    .ov-left, .ov-right { top: 36%; z-index: 1; }
+    .ov-left  { left: 36%; transform: translate(-50%, -50%) translateY(-8px); }
+    .ov-right { left: 64%; transform: translate(-50%, -50%) translateY(-8px); }
+    .ov-left.visible, .ov-right.visible { transform: translate(-50%, calc(-50% + 4px)); }
+
+    /* Sentence statement along the bottom */
+    .ov-statement {
+      bottom: 13%;
+      left: 50%;
+      width: min(900px, 84cqw);
+      text-align: center;
+      white-space: normal;
+      transform: translateX(-50%) translateY(16px);
+    }
+    .ov-statement.visible { transform: translateX(-50%) translateY(0); }
+
+    /* Split statement — one part above the model, one below */
+    .ov-sttop, .ov-stbottom {
+      left: 50%;
+      width: min(1000px, 88cqw);
+      text-align: center;
+      white-space: normal;
+    }
+    .ov-sttop    { top: 19%; transform: translateX(-50%) translateY(-14px); }
+    .ov-stbottom { top: 66%; transform: translateX(-50%) translateY(14px); }
+    .ov-sttop.visible, .ov-stbottom.visible { transform: translateX(-50%) translateY(0); }
+
+    /* Split statement — one part left of the model, one right */
+    .ov-stleft, .ov-stright {
+      top: 42%;
+      width: min(420px, 32cqw);
+      text-align: center;
+      white-space: normal;
+    }
+    .ov-stleft  { left: 25%; transform: translate(-50%, -50%) translateY(-10px); }
+    .ov-stright { left: 75%; transform: translate(-50%, -50%) translateY(-10px); }
+    .ov-stleft.visible, .ov-stright.visible { transform: translate(-50%, -50%); }
+
+    /* The side labels normally sit behind the transparent WebGL canvas so
+       the model can pass in front of them. */
+    .ov.behind { z-index: 1; }
+    .ov.in-front { z-index: 9; }
+
+    /* Title placement: drag to move, double-click to edit */
+    body.textedit .ov {
+      pointer-events: auto;
+      cursor: move;
+      transition: opacity var(--t-state) var(--ease); /* no transform transition while dragging */
+    }
+    body.textedit .ov.editing {
+      cursor: text;
+      outline: 1px dashed var(--accent);
+      outline-offset: var(--s-2);
+    }
+
+    /* --- Views list --- */
+    .sequence {
+      position: absolute;
+      top: 50%;
+      left: var(--s-6);
+      transform: translateY(-50%);
+      width: 240px;
+      height: min(560px, calc(100vh - 2 * 96px));
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      padding: var(--s-2);
+      background: var(--panel);
+      border-radius: var(--radius);
+      z-index: 10;
+      transition: transform var(--t-state) var(--ease), opacity var(--t-state) var(--ease);
+    }
+    body.seq-collapsed .sequence {
+      transform: translate(-125%, -50%);
+      opacity: 0;
+      pointer-events: none;
+    }
+    .seq-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 0 var(--s-2) var(--s-2);
+    }
+    .seq-item {
+      display: grid;
+      grid-template-columns: var(--s-5) minmax(0, 1fr) auto;
+      align-items: center;
+      gap: var(--s-2);
+      padding: var(--s-2);
+      border-radius: var(--radius);
+      color: var(--text-2);
+      cursor: pointer;
+      transition: background var(--t-hover) var(--ease), color var(--t-hover) var(--ease);
+    }
+    .seq-item:hover { background: var(--raise); color: var(--text); }
+    .seq-item.active { background: var(--raise); color: var(--text); }
+    .seq-item.active .idx { color: var(--accent); }
+    .seq-item.dragging { opacity: 0.4; }
+    .seq-item.drop-before { box-shadow: inset 0 2px 0 0 var(--accent); }
+    .seq-item.drop-after { box-shadow: inset 0 -2px 0 0 var(--accent); }
+    body.authoring .seq-item { cursor: grab; }
+    body.authoring .seq-item:active { cursor: grabbing; }
+    .seq-item .idx { font-variant-numeric: tabular-nums; font-weight: 500; }
+    .seq-item .cap { line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .seq-item .del {
+      appearance: none; border: none; background: transparent; font: inherit;
+      color: var(--text-2);
+      padding: 0 var(--s-1);
+      cursor: pointer;
+      visibility: hidden;
+    }
+    body.authoring .seq-item:hover .del { visibility: visible; }
+    .seq-item .del:hover { color: var(--text); }
+    .seq-empty {
+      display: flex;
+      flex-direction: column;
+      gap: var(--s-4);
+      padding: var(--s-2);
+      color: var(--text-2);
+      line-height: 1.5;
+    }
+    .seq-empty .btn { padding: var(--s-3); }
+
+    .seq-reopen {
+      position: absolute;
+      top: 50%;
+      left: 0;
+      transform: translateY(-50%);
+      display: none;
+      appearance: none;
+      border: none;
+      background: var(--panel);
+      color: var(--text-2);
+      font-family: inherit;
+      padding: var(--s-3);
+      border-radius: 0 var(--radius) var(--radius) 0;
+      cursor: pointer;
+      z-index: 10;
+      transition: color var(--t-hover) var(--ease);
+    }
+    .seq-reopen:hover { color: var(--text); }
+    body.seq-collapsed .seq-reopen { display: block; }
+
+    /* --- Author panel: four sections, separated by space --- */
+    .author-panel {
+      position: absolute;
+      top: 80px;
+      right: var(--s-6);
+      width: 288px;
+      max-height: calc(100vh - 80px - 96px);
+      overflow-y: auto;
+      padding: var(--s-4);
+      background: var(--panel);
+      border-radius: var(--radius);
+      z-index: 12;
+      display: none;
+      flex-direction: column;
+      gap: var(--s-5);
+    }
+    body.authoring .author-panel { display: flex; }
+    .ap-section { display: flex; flex-direction: column; gap: var(--s-2); }
+    .ap-head { display: flex; align-items: center; justify-content: space-between; min-height: var(--s-5); }
+    .ap-row { display: flex; gap: var(--s-2); }
+    .ap-row .btn { flex: 1; }
+    .ap-subhead { color: var(--text-2); font-size: var(--fs-label); }
+    .ap-note { color: var(--text-2); font-size: var(--fs-label); line-height: 1.5; }
+
+    .author-panel input[type=text] {
+      width: 100%;
+      min-width: 0;
+      padding: var(--s-1) 0;
+      background: transparent;
+      border: none;
+      border-bottom: 1px solid var(--line);
+      border-radius: 0;
+      color: var(--text);
+      font: inherit;
+      outline: none;
+    }
+    .author-panel input[type=text]:focus { border-bottom-color: var(--accent); }
+    .author-panel input[type=text]::placeholder { color: var(--text-2); }
+    .author-panel input[type=text]:disabled { opacity: 0.4; }
+
+    .ap-text-slots { display: flex; flex-direction: column; gap: var(--s-2); }
+    .ap-text-slot {
+      display: grid;
+      grid-template-columns: 76px minmax(0, 1fr) 56px;
+      gap: var(--s-2);
+      align-items: center;
+    }
+    .ap-text-slot label { color: var(--text-2); }
+    .ap-text-slot .btn { padding: var(--s-1) 0; }
+
+    .ap-lights { display: flex; flex-direction: column; gap: var(--s-3); }
+    .light-row { display: flex; flex-direction: column; gap: var(--s-1); }
+    .light-row .lr-head { display: flex; gap: var(--s-2); color: var(--text-2); }
+    .light-row .lr-val { color: var(--text); font-variant-numeric: tabular-nums; }
+    .light-row input[type=range] {
+      -webkit-appearance: none; appearance: none;
+      width: 100%; height: 2px;
+      background: var(--line); outline: none; cursor: pointer;
+    }
+    .light-row input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: var(--s-3); height: var(--s-3); border-radius: var(--radius);
+      background: var(--text); cursor: pointer;
+    }
+    .light-row input[type=range]::-moz-range-thumb {
+      width: var(--s-3); height: var(--s-3); border-radius: var(--radius);
+      background: var(--text); cursor: pointer; border: none;
+    }
+    .light-row input[type=range]:focus-visible::-webkit-slider-thumb { background: var(--accent); }
+
+    /* --- Toast (system feedback) --- */
+    .toast {
+      position: absolute;
+      bottom: 88px;
+      left: 50%;
+      transform: translateX(-50%) translateY(var(--s-2));
+      padding: var(--s-2) var(--s-4);
+      background: var(--raise);
+      border-radius: var(--radius);
+      color: var(--text);
+      z-index: 30;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity var(--t-state) var(--ease), transform var(--t-state) var(--ease);
+    }
+    .toast.visible { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    /* --- Loader / empty state --- */
+    .loader {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: var(--s-3);
+      text-align: center;
+      padding: 0 var(--s-5);
+      background: var(--ground);
+      z-index: 20;
+      transition: opacity var(--t-media) var(--ease);
+    }
+    .loader.hidden { opacity: 0; pointer-events: none; }
+    .loader .pct { color: var(--text-2); font-variant-numeric: tabular-nums; }
+    .loader .drop-prompt { display: none; flex-direction: column; align-items: center; gap: var(--s-2); }
+    .loader.idle .pct { display: none; }
+    .loader.idle .drop-prompt { display: flex; }
+    .drop-prompt .dp-title { font-size: var(--fs-lead); font-weight: 500; }
+    .drop-prompt .dp-sub { color: var(--text-2); margin-bottom: var(--s-4); }
+
+    /* Full-window outline while a file is dragged over the page */
+    .drop-veil {
+      position: fixed; inset: var(--s-3); z-index: 40;
+      display: none; align-items: center; justify-content: center;
+      border: 1px dashed var(--accent); border-radius: var(--radius);
+      font-size: var(--fs-lead); font-weight: 500;
+      pointer-events: none;
+    }
+    body.file-over .drop-veil { display: flex; }
+
+    /* --- Load report: stays until dismissed, so it can be read in full --- */
+    .report {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: min(480px, calc(100vw - 2 * var(--s-4)));
+      max-height: calc(100vh - 2 * var(--s-6));
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: var(--s-3);
+      padding: var(--s-5);
+      background: var(--panel);
+      border-radius: var(--radius);
+      line-height: 1.5;
+      z-index: 35;
+    }
+    .report[hidden] { display: none; }
+    .report-title { font-size: var(--fs-lead); font-weight: 500; line-height: 1.3; }
+    .report-fix { display: flex; flex-direction: column; gap: var(--s-1); }
+    .report-fix[hidden] { display: none; }
+    .report-facts {
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr);
+      gap: var(--s-1) var(--s-4);
+      padding-top: var(--s-3);
+      border-top: 1px solid var(--raise);
+    }
+    .report-facts[hidden] { display: none; }
+    .report-facts dt { color: var(--text-2); }
+    .report-facts dd { overflow-wrap: anywhere; }
+    .report-progress { height: 2px; background: var(--raise); }
+    .report-progress[hidden] { display: none; }
+    .report-progress > div { height: 100%; width: 0; background: var(--accent); }
+    /* Video export measures caption layout with transitions off */
+    body.measuring .ov { transition: none !important; }
+    body.exporting .dock,
+    body.exporting .sequence,
+    body.exporting .header-actions,
+    body.exporting .author-panel { pointer-events: none; opacity: 0.4; }
+    .report-raw {
+      color: var(--text-2);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; /* the one technical-token face */
+      font-size: var(--fs-label);
+      overflow-wrap: anywhere;
+    }
+    .report-raw:empty { display: none; }
+    .report .ap-row { justify-content: flex-start; padding-top: var(--s-2); }
+    .report .ap-row .btn { flex: 0 0 auto; }
+    body.report-open .drop-prompt { visibility: hidden; }
+
+    /* Breakpoint 1: narrow windows */
+    @media (max-width: 600px) {
+      .header { padding: var(--s-4); }
+      .sequence { left: var(--s-4); width: 200px; }
+    }
+
+    /* Breakpoint 2: portrait. Author panel becomes a bottom sheet so the
+       model stays visible while re-framing portrait views. */
+    @media (max-aspect-ratio: 1 / 1) {
+      .header { padding: var(--s-4); }
+      .sequence {
+        top: 64px;
+        left: var(--s-4);
+        transform: none;
+        max-width: 60vw;
+        height: min(560px, calc(100vh - 64px - 96px));
+      }
+      body.seq-collapsed .sequence { transform: translateX(-125%); }
+      .dock { bottom: var(--s-4); max-width: calc(100vw - 2 * var(--s-4)); }
+      .dock #btn-sound, .dock #btn-rotate, .dock #btn-wire { display: none; }
+      body:not(.phone) .dock #btn-phone { display: none; } /* already a portrait frame */
+      body.authoring .author-panel {
+        top: auto;
+        bottom: 72px;
+        left: var(--s-3);
+        right: var(--s-3);
+        width: auto;
+        max-height: 40vh;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { transition: none !important; animation: none !important; }
+    }
+  </style>
+</head>
+<body class="no-model">
+  <!-- Stage: the render surface. In phone mode it becomes a centered
+       portrait frame. -->
+  <div class="stage" id="stage">
+    <div id="app"></div>
+
+    <!-- Big-type title overlays -->
+    <div class="ov ov-top" id="ov-top"></div>
+    <div class="ov ov-bottom" id="ov-bottom"></div>
+    <div class="ov ov-left" id="ov-left"></div>
+    <div class="ov ov-right" id="ov-right"></div>
+    <div class="ov ov-statement" id="ov-statement"></div>
+    <div class="ov ov-sttop" id="ov-sttop"></div>
+    <div class="ov ov-stbottom" id="ov-stbottom"></div>
+    <div class="ov ov-stleft" id="ov-stleft"></div>
+    <div class="ov ov-stright" id="ov-stright"></div>
+  </div>
+
+  <header class="header">
+    <div class="brand">
+      <h1 class="app-name">Frameshot</h1>
+      <span class="model-name" id="model-name"></span>
+    </div>
+    <div class="header-actions">
+      <button class="btn" id="btn-open" type="button">Open new model</button>
+      <button class="btn" id="btn-author" type="button">Author</button>
+    </div>
+  </header>
+
+  <nav class="sequence" id="sequence" aria-label="Views"></nav>
+  <button class="seq-reopen label" id="seq-reopen" type="button">Views</button>
+
+  <!-- Author panel (hidden until Author mode is on) -->
+  <aside class="author-panel" id="author-panel" aria-label="Author">
+    <section class="ap-section">
+      <div class="ap-head">
+        <span class="label">View</span>
+        <span class="label key" id="ap-vp">Landscape</span>
+      </div>
+      <input id="ap-caption" type="text" placeholder="Caption" />
+      <div class="ap-row">
+        <button class="btn outline" id="ap-capture" type="button">Capture new</button>
+        <button class="btn" id="ap-update" type="button">Update selected</button>
+      </div>
+    </section>
+
+    <section class="ap-section">
+      <div class="ap-head">
+        <span class="label">Caption Overlay</span>
+        <button class="btn small" id="ap-textedit" type="button">Place on stage</button>
+      </div>
+      <span class="ap-subhead">Caption positions</span>
+      <div class="ap-text-slots" id="ap-text-slots"></div>
+    </section>
+
+    <section class="ap-section">
+      <div class="ap-head">
+        <span class="label" id="ap-light-title">Lighting</span>
+        <button class="btn small" id="ap-light-reset" type="button">Reset</button>
+      </div>
+      <div class="ap-lights" id="ap-lights"></div>
+    </section>
+
+    <section class="ap-section">
+      <div class="ap-head"><span class="label">Views file</span></div>
+      <div class="ap-row">
+        <button class="btn" id="ap-export" type="button">Export</button>
+        <button class="btn" id="ap-import" type="button">Import</button>
+        <button class="btn" id="ap-clear" type="button">Clear all</button>
+      </div>
+      <p class="ap-note">Views are saved in this browser, per model file name.</p>
+    </section>
+  </aside>
+
+  <div class="dock">
+    <div class="group">
+      <button class="btn" id="btn-play" type="button">Play</button>
+      <button class="btn" id="btn-export-video" type="button">Export video</button>
+    </div>
+    <div class="group">
+      <button class="btn" id="btn-rotate" type="button">Auto-rotate</button>
+      <button class="btn" id="btn-wire" type="button">Wireframe</button>
+      <button class="btn" id="btn-phone" type="button">Phone frame</button>
+      <button class="btn" id="btn-sound" type="button" hidden>Sound</button>
+    </div>
+    <div class="group">
+      <button class="btn" id="btn-reset" type="button">Reset view</button>
+      <button class="btn solid" id="btn-shot" type="button">Take an image</button>
+    </div>
+  </div>
+
+
+  <div class="toast" id="toast" role="status"></div>
+
+  <div class="loader idle" id="loader">
+    <div class="pct" id="loader-pct">Loading 0%</div>
+    <div class="drop-prompt">
+      <div class="dp-title">Drop a 3D model anywhere</div>
+      <div class="dp-sub">glb, gltf with its files, obj, stl or fbx</div>
+      <button class="btn solid" type="button" id="dp-open">Open model</button>
+    </div>
+  </div>
+  <div class="drop-veil">Drop to load</div>
+
+  <div class="report" id="report" role="alertdialog" aria-labelledby="report-title" aria-describedby="report-body" hidden>
+    <span class="label key" id="report-kind"></span>
+    <h2 class="report-title" id="report-title"></h2>
+    <p id="report-body"></p>
+    <div class="report-fix" id="report-fix-row">
+      <span class="label">How to fix</span>
+      <p id="report-fix"></p>
+    </div>
+    <dl class="report-facts" id="report-facts"></dl>
+    <div class="report-progress" id="report-progress" hidden><div id="report-progress-bar"></div></div>
+    <p class="report-raw" id="report-raw"></p>
+    <div class="ap-row">
+      <button class="btn solid" id="report-primary" type="button"></button>
+      <button class="btn" id="report-close" type="button">Dismiss</button>
+    </div>
+  </div>
+
+  <input type="file" id="file-model" accept=".glb,.gltf,.obj,.stl,.fbx,.bin,.png,.jpg,.jpeg,.webp,.ktx2" multiple hidden />
+  <input type="file" id="file-json" accept=".json,application/json" hidden />
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+    import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+    import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+    import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+    import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+    import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
+    import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+
+    // Every model is scaled so its largest dimension is this many units.
+    // Keeps light distance, shadow frustum and saved views consistent
+    // regardless of the source file's units.
+    const MODEL_SIZE = 10;
+    // Pixel ratio used when rendering a frame shot (2 = double the on-screen size).
+    const SHOT_PIXEL_RATIO = 2;
+    const container = document.getElementById('app');
+    const stageEl = document.getElementById('stage');
+    // The render surface is the stage (full viewport, or a phone-shaped frame).
+    function renderW() { return stageEl.clientWidth || window.innerWidth; }
+    function renderH() { return stageEl.clientHeight || window.innerHeight; }
+
+    // ============================================================
+    //  VIEWS
+    //  Each view = a saved camera pose + caption, with optional
+    //  lighting, title text and a portrait override. Views are saved
+    //  to localStorage per model file name (models are normalised to
+    //  MODEL_SIZE, so a view only makes sense for the model it was
+    //  captured on). Export / Import JSON moves them between machines.
+    // ============================================================
+    const LS_PREFIX = 'frameshot_views_v1:';
+    let modelName = null;
+
+    function lsKey() { return LS_PREFIX + (modelName || ''); }
+    function loadStates() {
+      try {
+        const raw = modelName && localStorage.getItem(lsKey());
+        if (raw) return JSON.parse(raw);
+      } catch (e) { /* ignore */ }
+      return [];
+    }
+    function saveStates() {
+      if (!modelName) return;
+      try { localStorage.setItem(lsKey(), JSON.stringify(states)); } catch (e) {}
+    }
+
+    let states = [];
+    let activeIndex = -1;
+
+    // Portrait (tall) frames can use a per-view camera override so the shots
+    // that look wrong in a phone aspect can be re-framed independently.
+    function isPortrait() { return renderH() > renderW(); }
+    let lastPortrait = isPortrait();
+
+    // --- Renderer ---
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(renderW(), renderH());
+    renderer.setClearColor(0x000000, 0); // transparent canvas; page provides the black
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    container.appendChild(renderer.domElement);
+
+    // --- Scene ---
+    const scene = new THREE.Scene();
+    scene.background = null; // transparent so HTML can sit behind the model
+
+    // --- Camera ---
+    const camera = new THREE.PerspectiveCamera(45, renderW() / renderH(), 0.01, 1000);
+    camera.position.set(3, 1.6, 4.5);
+
+    // --- Environment (image-based lighting for PBR reflections) ---
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+    // --- Lights ---
+    const key = new THREE.DirectionalLight(0xffffff, 2.4);
+    key.position.set(5, 8, 6);
+    key.castShadow = true;
+    key.shadow.mapSize.set(2048, 2048);
+    key.shadow.bias = -0.0004;
+    key.shadow.normalBias = 0.02;
+    const sc = key.shadow.camera; // cover a MODEL_SIZE model from any key angle
+    sc.left = sc.bottom = -MODEL_SIZE * 0.8;
+    sc.right = sc.top = MODEL_SIZE * 0.8;
+    sc.near = 0.5; sc.far = 40;
+    scene.add(key);
+
+    const fill = new THREE.DirectionalLight(0x9db4ff, 0.6);
+    fill.position.set(-6, 2, -3);
+    scene.add(fill);
+
+    const rim = new THREE.DirectionalLight(0xffffff, 1.2);
+    rim.position.set(-2, 4, -8);
+    scene.add(rim);
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.15);
+    scene.add(ambient);
+
+    // ============================================================
+    //  LIGHTING MODEL
+    //  A small set of expressive params. Each view can carry its
+    //  own `light` object; views without one use DEFAULT_LIGHT.
+    //  Params tween alongside the camera.
+    // ============================================================
+    const DEG2RAD = Math.PI / 180;
+    const LIGHT_RADIUS = 11;            // key light distance (direction is what matters)
+
+    const DEFAULT_LIGHT = {
+      exposure: 1.0,      // overall brightness (ACES tone-map exposure)
+      keyIntensity: 2.4,  // main light strength
+      keyAzimuth: 40,     // main light compass angle (deg around vertical)
+      keyElevation: 46,   // main light height (deg above horizon)
+      rimIntensity: 1.2,  // back/edge light strength
+      ambient: 0.15,      // shadow fill (0 = deep shadows)
+    };
+
+    const LIGHT_KEYS = Object.keys(DEFAULT_LIGHT);
+    const liveLight = { ...DEFAULT_LIGHT };
+
+    function lightForState(s) {
+      return (s && s.light) ? { ...DEFAULT_LIGHT, ...s.light } : { ...DEFAULT_LIGHT };
+    }
+
+    function applyLight(L) {
+      renderer.toneMappingExposure = L.exposure;
+      key.intensity = L.keyIntensity;
+      const el = L.keyElevation * DEG2RAD;
+      const az = L.keyAzimuth * DEG2RAD;
+      key.position.set(
+        LIGHT_RADIUS * Math.cos(el) * Math.sin(az),
+        LIGHT_RADIUS * Math.sin(el),
+        LIGHT_RADIUS * Math.cos(el) * Math.cos(az)
+      );
+      rim.intensity = L.rimIntensity;
+      ambient.intensity = L.ambient;
+    }
+    applyLight(liveLight);
+
+    // --- Controls ---
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.rotateSpeed = 0.9;
+    controls.zoomSpeed = 1.8; // 2× — a pinch dollies twice as far
+    controls.panSpeed = 0.8;
+    controls.minDistance = 0.5;
+    controls.maxDistance = 40;
+    controls.autoRotateSpeed = 1.1;
+    // If the user grabs the model, drop out of the active "state"
+    controls.addEventListener('start', () => {
+      stopPlay();
+      // During authoring, the active view is the destination for Update.
+      // Keep it selected while the author orbits/reframes the model; outside
+      // authoring a manual orbit still exits the scripted view as before.
+      if (!isTweening() && !document.body.classList.contains('authoring')) clearActive();
+    });
+
+    // --- Ground shadow catcher ---
+    const shadowGround = new THREE.Mesh(
+      new THREE.PlaneGeometry(200, 200),
+      new THREE.ShadowMaterial({ opacity: 0.35 })
+    );
+    shadowGround.rotation.x = -Math.PI / 2;
+    shadowGround.receiveShadow = true;
+    scene.add(shadowGround);
+
+    // --- Load model ---
+    let model = null;
+    const wireMeshes = [];
+    const homeState = { pos: new THREE.Vector3(), target: new THREE.Vector3() };
+
+    const loaderEl = document.getElementById('loader');
+    const loaderPct = document.getElementById('loader-pct');
+    const modelNameEl = document.getElementById('model-name');
+    const MODEL_EXTS = ['glb', 'gltf', 'obj', 'stl', 'fbx'];
+
+    function extOf(name) { return (name.split('?')[0].split('.').pop() || '').toLowerCase(); }
+    function baseName(name) { return decodeURIComponent(name.split('?')[0].split('/').pop()); }
+    function fmtBytes(n) {
+      if (n == null) return 'Unknown';
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / 1024 / 1024).toFixed(1) + ' MB';
+    }
+    function quoted(name) { return '“' + name + '”'; }
+    function listOf(items) { return items.length > 1 ? items.slice(0, -1).join(', ') + ' and ' + items.at(-1) : items[0]; }
+
+    // A load failure the user can act on: what happened, why, and the fix.
+    class LoadError extends Error {
+      constructor({ title, body, fix, cause }) {
+        super(title);
+        Object.assign(this, { title, body, fix, cause });
+      }
+    }
+
+    // glTF extensions three r160's GLTFLoader can read, given the decoders below.
+    const SUPPORTED_GLTF_EXTENSIONS = new Set([
+      'KHR_draco_mesh_compression', 'EXT_meshopt_compression', 'KHR_mesh_quantization',
+      'KHR_texture_basisu', 'KHR_texture_transform', 'EXT_texture_webp', 'EXT_texture_avif',
+      'KHR_materials_clearcoat', 'KHR_materials_ior', 'KHR_materials_specular',
+      'KHR_materials_transmission', 'KHR_materials_volume', 'KHR_materials_sheen',
+      'KHR_materials_iridescence', 'KHR_materials_anisotropy', 'KHR_materials_emissive_strength',
+      'KHR_materials_unlit', 'KHR_lights_punctual', 'EXT_mesh_gpu_instancing',
+    ]);
+    const EXTENSION_FIXES = {
+      KHR_materials_pbrSpecularGlossiness: 'This is an old material model. Re-export with metallic-roughness materials (the default in Blender’s glTF exporter), or convert it with gltf-transform metalrough.',
+      KHR_techniques_webgl: 'Custom shader techniques aren’t supported. Re-export with standard PBR materials.',
+    };
+
+    // Decoders for compressed glTF are fetched from the CDN on first use.
+    const DECODER_BASE = 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/';
+    let dracoLoader = null;
+    let ktx2Loader = null;
+    function makeGltfLoader(manager) {
+      dracoLoader ??= new DRACOLoader(manager).setDecoderPath(DECODER_BASE + 'draco/gltf/');
+      ktx2Loader ??= new KTX2Loader(manager).setTranscoderPath(DECODER_BASE + 'basis/').detectSupport(renderer);
+      return new GLTFLoader(manager)
+        .setDRACOLoader(dracoLoader)
+        .setKTX2Loader(ktx2Loader)
+        .setMeshoptDecoder(MeshoptDecoder);
+    }
+
+    // Read the whole file, turning network and empty-file problems into
+    // specific messages before any parser sees it.
+    async function readBytes(url, name, ctx) {
+      let res;
+      try {
+        res = await fetch(url);
+      } catch (e) {
+        throw new LoadError({
+          title: `Couldn’t read ${quoted(name)}`,
+          body: ctx.local
+            ? 'The browser couldn’t read the file from disk. It may have been moved, renamed or deleted after you picked it.'
+            : `The request for ${url} failed before the server answered.`,
+          fix: location.protocol === 'file:'
+            ? 'This page is open from file://, which blocks file requests. Serve the folder over HTTP (python3 -m http.server 8137) and open http://localhost:8137.'
+            : ctx.local ? 'Pick the file again.' : 'Check that the local server is still running and that the path is correct.',
+          cause: e,
+        });
+      }
+      if (!res.ok) {
+        throw new LoadError({
+          title: res.status === 404 ? `${quoted(name)} wasn’t found` : `The server refused ${quoted(name)}`,
+          body: `GET ${url} returned ${res.status} ${res.statusText}.`,
+          fix: `Paths in ?model= are relative to this page (${location.origin}${location.pathname}). Check that the file is inside the folder being served.`,
+        });
+      }
+      const buf = await res.arrayBuffer();
+      ctx.facts.Size = fmtBytes(buf.byteLength);
+      if (buf.byteLength === 0) {
+        throw new LoadError({
+          title: `${quoted(name)} is empty`,
+          body: 'The file is 0 bytes, so there’s nothing to load.',
+          fix: 'Re-export or re-download the file.',
+        });
+      }
+      const head = new TextDecoder().decode(new Uint8Array(buf, 0, Math.min(200, buf.byteLength)));
+      if (head.startsWith('version https://git-lfs')) {
+        throw new LoadError({
+          title: `${quoted(name)} is a Git LFS pointer, not the model`,
+          body: 'The file only contains a short text reference to the real model, which is stored in Git LFS and hasn’t been downloaded.',
+          fix: 'Run git lfs pull in that repository, then open the file again.',
+        });
+      }
+      if (/^\s*<(!doctype|html)/i.test(head)) {
+        throw new LoadError({
+          title: `${quoted(name)} is a web page, not a model`,
+          body: 'The file contains HTML. This usually happens when a download link saved an error or login page instead of the file.',
+          fix: 'Download the model again from its source.',
+        });
+      }
+      return buf;
+    }
+
+    // Read the glTF JSON (from .gltf text or the .glb JSON chunk) and check
+    // version, required extensions and companion files up front.
+    function inspectGltf(buf, name, ext, ctx) {
+      const bytes = new Uint8Array(buf);
+      const magic = new TextDecoder().decode(bytes.subarray(0, 4));
+      let json;
+      if (magic === 'glTF') {
+        const view = new DataView(buf);
+        const version = view.getUint32(4, true);
+        ctx.facts.Format = `Binary glTF ${version}.0 (.glb)`;
+        if (version !== 2) {
+          throw new LoadError({
+            title: `${quoted(name)} is glTF ${version}.0`,
+            body: 'Only glTF 2.0 is supported. glTF 1.0 files use a different structure.',
+            fix: 'Re-export from your 3D tool as glTF 2.0 (.glb).',
+          });
+        }
+        const jsonLength = view.getUint32(12, true);
+        try {
+          json = JSON.parse(new TextDecoder().decode(bytes.subarray(20, 20 + jsonLength)));
+        } catch (e) {
+          throw new LoadError({
+            title: `${quoted(name)} is damaged`,
+            body: 'The file starts like a .glb, but its scene description can’t be read. The file is probably truncated or corrupted.',
+            fix: 'Re-export or re-download it.',
+            cause: e,
+          });
+        }
+      } else {
+        if (ext === 'glb') {
+          const looksJson = /^\s*\{/.test(new TextDecoder().decode(bytes.subarray(0, 64)));
+          throw new LoadError({
+            title: `${quoted(name)} isn’t a binary glTF file`,
+            body: `A .glb file starts with the bytes “glTF”, but this one starts with “${magic.replace(/[^\x20-\x7e]/g, '·')}”.`
+              + (looksJson ? ' It looks like a text .gltf file with the wrong extension.' : ''),
+            fix: looksJson ? 'Rename it to .gltf and open it together with its .bin and texture files.' : 'Check the file is really a glTF export. Re-export it if needed.',
+          });
+        }
+        ctx.facts.Format = 'glTF (.gltf, text)';
+        try {
+          json = JSON.parse(new TextDecoder().decode(bytes));
+        } catch (e) {
+          throw new LoadError({
+            title: `${quoted(name)} isn’t valid glTF`,
+            body: 'A .gltf file is JSON text, and this one couldn’t be parsed as JSON.',
+            fix: 'Re-export the file. If you edited it by hand, check it in a JSON validator.',
+            cause: e,
+          });
+        }
+      }
+
+      const asset = json.asset || {};
+      if (asset.generator) ctx.facts['Exported by'] = asset.generator;
+      if (asset.version && parseInt(asset.version, 10) < 2) {
+        throw new LoadError({
+          title: `${quoted(name)} is glTF ${asset.version}`,
+          body: 'Only glTF 2.0 is supported.',
+          fix: 'Re-export from your 3D tool as glTF 2.0 (.glb).',
+        });
+      }
+      const required = json.extensionsRequired || [];
+      if (required.length) ctx.facts['Requires'] = required.join(', ');
+      const unsupported = required.filter((x) => !SUPPORTED_GLTF_EXTENSIONS.has(x));
+      if (unsupported.length) {
+        throw new LoadError({
+          title: `${quoted(name)} uses features this viewer can’t read`,
+          body: `The file requires the glTF extension${unsupported.length > 1 ? 's' : ''} ${listOf(unsupported)}, which three.js 0.160 doesn’t support.`,
+          fix: unsupported.map((x) => EXTENSION_FIXES[x]).filter(Boolean).join(' ')
+            || 'Re-export without that option, or open the file in Blender and export it again as plain glTF 2.0.',
+        });
+      }
+
+      // A dropped .gltf must come with the files it points at.
+      if (ctx.local) {
+        const refs = [...(json.buffers || []), ...(json.images || [])]
+          .map((r) => r.uri).filter((u) => u && !u.startsWith('data:'));
+        const missing = [...new Set(refs.map(baseName))].filter((f) => !ctx.blobs.has(f));
+        if (missing.length) {
+          throw new LoadError({
+            title: `${quoted(name)} needs ${missing.length} more file${missing.length > 1 ? 's' : ''}`,
+            body: `It keeps its data in separate files that weren’t included: ${listOf(missing)}.`,
+            fix: 'Select or drop the .gltf together with all of those files. Or export a single .glb instead, which bundles everything.',
+          });
+        }
+      }
+    }
+
+    // FBX: three reads binary FBX 7.0+ (2011 and later) and ASCII FBX.
+    function inspectFbx(buf, name, ctx) {
+      const head = new TextDecoder().decode(new Uint8Array(buf, 0, Math.min(23, buf.byteLength)));
+      if (head.startsWith('Kaydara FBX Binary') && buf.byteLength > 27) {
+        const version = new DataView(buf).getUint32(23, true);
+        ctx.facts.Format = `FBX ${(version / 1000).toFixed(1)} (binary)`;
+        if (version < 7000) {
+          throw new LoadError({
+            title: `${quoted(name)} is FBX ${(version / 1000).toFixed(1)}, which is too old`,
+            body: 'This viewer reads FBX 7.0 (2011) and newer.',
+            fix: 'Re-export as FBX 2013 or later, or better, as glTF (.glb).',
+          });
+        }
+      } else {
+        ctx.facts.Format = 'FBX (ASCII)';
+      }
+    }
+
+    // Translate a parser exception into something actionable.
+    function describeParseError(err, name, ctx) {
+      if (err instanceof LoadError) return err;
+      const msg = (err && err.message) || String(err);
+      if (/draco/i.test(msg) || /draco/i.test(ctx.lastFailedUrl || '')) {
+        return new LoadError({
+          title: 'Couldn’t load the Draco mesh decoder',
+          body: `The meshes in ${quoted(name)} are Draco-compressed. Decoding them needs a small decoder downloaded from cdn.jsdelivr.net, and that download failed.`,
+          fix: 'Check your internet connection, then open the file again.',
+          cause: err,
+        });
+      }
+      if (/basis|ktx2|transcoder/i.test(msg + (ctx.lastFailedUrl || ''))) {
+        return new LoadError({
+          title: 'Couldn’t load the KTX2 texture decoder',
+          body: `${quoted(name)} uses KTX2 (Basis) compressed textures. Decoding them needs a decoder downloaded from cdn.jsdelivr.net, and that download failed.`,
+          fix: 'Check your internet connection, then open the file again.',
+          cause: err,
+        });
+      }
+      if (/Failed to load buffer/i.test(msg)) {
+        return new LoadError({
+          title: `${quoted(name)} is missing its .bin data`,
+          body: `The geometry file it points to couldn’t be loaded${ctx.lastFailedUrl ? ' (' + baseName(ctx.lastFailedUrl) + ')' : ''}.`,
+          fix: 'Open the .gltf together with its .bin file, or export a single .glb instead.',
+          cause: err,
+        });
+      }
+      return new LoadError({
+        title: `Couldn’t decode ${quoted(name)}`,
+        body: 'The file was read, but the ' + (ctx.facts.Format || '.' + extOf(name)) + ' parser failed on its contents. The file may be corrupt or truncated, or exported with options this viewer doesn’t handle.',
+        fix: 'Re-export it, ideally as .glb. To check whether the file itself is broken, try opening it in another viewer such as Blender.',
+        cause: err,
+      });
+    }
+
+    async function parseModel(buf, url, name, ext, manager, ctx) {
+      const path = ctx.local ? '' : THREE.LoaderUtils.extractUrlBase(url);
+      if (ext === 'glb' || ext === 'gltf') {
+        inspectGltf(buf, name, ext, ctx);
+        const gltf = await new Promise((resolve, reject) =>
+          makeGltfLoader(manager).parse(buf, path, resolve, reject));
+        return gltf.scene;
+      }
+      if (ext === 'fbx') {
+        inspectFbx(buf, name, ctx);
+        return new FBXLoader(manager).parse(buf, path);
+      }
+      if (ext === 'obj') {
+        ctx.facts.Format = 'Wavefront OBJ (geometry only, no materials)';
+        return new OBJLoader(manager).parse(new TextDecoder().decode(buf));
+      }
+      if (ext === 'stl') {
+        ctx.facts.Format = 'STL (geometry only)';
+        const geo = new STLLoader(manager).parse(buf);
+        geo.computeVertexNormals();
+        const mat = new THREE.MeshStandardMaterial({ color: 0xb8bcc4, metalness: 0.2, roughness: 0.55 });
+        return new THREE.Mesh(geo, mat);
+      }
+      throw new LoadError({
+        title: `.${ext} files aren’t supported`,
+        body: `${quoted(name)} isn’t one of the formats this viewer opens.`,
+        fix: 'Supported formats: .glb, .gltf, .obj, .stl and .fbx. Convert other formats to .glb first (Blender can import most formats and export glTF).',
+      });
+    }
+
+    // Reject models that parsed but have nothing to show.
+    function checkGeometry(obj, name) {
+      let meshes = 0, nodes = 0, cameras = 0, lights = 0;
+      obj.traverse((o) => {
+        nodes++;
+        if (o.isMesh || o.isPoints || o.isLine) meshes++;
+        if (o.isCamera) cameras++;
+        if (o.isLight) lights++;
+      });
+      if (meshes === 0) {
+        const extras = [cameras && `${cameras} camera${cameras > 1 ? 's' : ''}`, lights && `${lights} light${lights > 1 ? 's' : ''}`].filter(Boolean);
+        throw new LoadError({
+          title: `${quoted(name)} has no geometry`,
+          body: `It loaded, but contains ${nodes} node${nodes > 1 ? 's' : ''}${extras.length ? ' (' + listOf(extras) + ')' : ''} and no meshes.`,
+          fix: 'Check the export included your meshes. In Blender, untick “Selected objects” in the export options, or select the meshes before exporting.',
+        });
+      }
+      const size = new THREE.Box3().setFromObject(obj).getSize(new THREE.Vector3());
+      if (![size.x, size.y, size.z].every(Number.isFinite) || Math.max(size.x, size.y, size.z) === 0) {
+        throw new LoadError({
+          title: `${quoted(name)} has no size`,
+          body: `It contains ${meshes} mesh${meshes > 1 ? 'es' : ''}, but their vertices are all at one point or invalid, so there’s nothing to frame.`,
+          fix: 'Check the model in your 3D tool. Apply transforms before exporting.',
+        });
+      }
+      return meshes;
+    }
+
+    // ctx: { local, blobs } for dropped files; facts are filled in as we go.
+    async function loadModel(url, name, manager = new THREE.LoadingManager(), ctx = {}) {
+      const ext = extOf(name);
+      ctx.facts = { File: name, ...(ctx.size != null ? { Size: fmtBytes(ctx.size) } : {}) };
+      ctx.failedUrls = [];
+      manager.onError = (u) => { ctx.lastFailedUrl = u; ctx.failedUrls.push(u); };
+      stopPlay();
+      hideReport();
+      loaderEl.classList.remove('idle', 'hidden');
+      loaderPct.textContent = `Reading ${name}`;
+
+      let obj, meshCount;
+      try {
+        const buf = await readBytes(url, name, ctx);
+        loaderPct.textContent = `Decoding ${name}`;
+        obj = await parseModel(buf, url, name, ext, manager, ctx);
+        meshCount = checkGeometry(obj, name);
+      } catch (err) {
+        console.error(`Error loading ${name}:`, err);
+        if (model) loaderEl.classList.add('hidden');
+        else loaderEl.classList.add('idle');
+        const e = describeParseError(err, name, ctx);
+        if (ctx.restored) forgetLastModel(); // don't retry a broken file on every reload
+        showReport({
+          kind: 'error', ...e, facts: ctx.facts, raw: e.cause ? String(e.cause.message || e.cause) : '',
+          label: ctx.restored ? 'Couldn’t reopen your last model' : undefined,
+        });
+        return;
+      }
+
+      if (model) disposeModel(model);
+      model = obj;
+      wireMeshes.length = 0;
+      model.traverse((o) => {
+        if (o.isMesh) {
+          o.castShadow = true;
+          o.receiveShadow = true;
+          wireMeshes.push(o);
+          if (wireOn) forEachMaterial(o, (m) => { m.wireframe = true; });
+        }
+      });
+      frameModel(model);
+      scene.add(model);
+
+      modelName = name;
+      if (ctx.local && !ctx.restored) rememberLastModel(ctx.files);
+      if (!ctx.local) forgetLastModel(); // a ?model= URL reopens itself
+      modelNameEl.textContent = name;
+      document.body.classList.remove('no-model');
+      document.title = name + ' — Frameshot';
+      states = loadStates();
+      activeIndex = -1;
+      Object.assign(liveLight, DEFAULT_LIGHT);
+      applyLight(liveLight);
+      hideOverlays();
+
+      // Loaded, but some textures or other files didn't come through.
+      const failed = [...new Set(ctx.failedUrls.map(baseName))].filter((f) => !/draco|basis/i.test(f));
+      if (failed.length) {
+        showReport({
+          kind: 'warning',
+          title: `${quoted(name)} loaded, but ${failed.length} file${failed.length > 1 ? 's' : ''} couldn’t be found`,
+          body: `The model is showing ${meshCount} mesh${meshCount > 1 ? 'es' : ''}, but these files it refers to are missing, so some surfaces may be untextured: ${listOf(failed)}.`,
+          fix: ctx.local
+            ? 'Open the model together with those files (select them all, or drop them at once).'
+            : 'Put those files next to the model in the served folder.',
+          facts: ctx.facts,
+        });
+      }
+
+      // Render a settled frame before starting the first move so shader
+      // setup never competes with the opening camera animation.
+      renderer.compile(scene, camera);
+      requestAnimationFrame(() => {
+        renderer.render(scene, camera);
+        requestAnimationFrame(() => {
+          loaderEl.classList.add('hidden');
+          renderSequence();
+          renderTextSlots();
+          syncLightSliders();
+          if (states.length > 0) goToState(0);
+        });
+      });
+    }
+
+    function forEachMaterial(mesh, fn) {
+      (Array.isArray(mesh.material) ? mesh.material : [mesh.material]).forEach(fn);
+    }
+
+    function disposeModel(obj) {
+      scene.remove(obj);
+      obj.traverse((o) => {
+        if (!o.isMesh) return;
+        o.geometry.dispose();
+        forEachMaterial(o, (m) => {
+          for (const v of Object.values(m)) if (v && v.isTexture) v.dispose();
+          m.dispose();
+        });
+      });
+    }
+
+    // Formats people commonly try, with the specific way to convert them.
+    const CONVERT_HINTS = {
+      blend: 'A .blend file is a Blender project, not an export. In Blender choose File › Export › glTF 2.0, then open the .glb.',
+      usdz: 'USDZ isn’t supported. Import it into Blender (or Reality Converter) and export glTF (.glb).',
+      usd: 'USD isn’t supported. Import it into Blender and export glTF (.glb).',
+      dae: 'Collada (.dae) isn’t supported. Import it into Blender and export glTF (.glb).',
+      '3ds': '.3ds isn’t supported. Import it into Blender and export glTF (.glb).',
+      ply: 'PLY isn’t supported. Import it into Blender and export glTF (.glb) or STL.',
+      step: 'CAD formats aren’t supported. Export a mesh (STL or glTF) from your CAD tool.',
+      stp: 'CAD formats aren’t supported. Export a mesh (STL or glTF) from your CAD tool.',
+      zip: 'Unzip the archive first, then open the files inside it.',
+    };
+
+    // Load from a set of local files (picker or drop). The first model
+    // file is the main one; the rest are served to the loader by name.
+    function loadFiles(fileList, how) {
+      const files = [...fileList];
+      const main = files.find((f) => MODEL_EXTS.includes(extOf(f.name)));
+      if (!main) {
+        const names = files.map((f) => f.name);
+        const hint = files.map((f) => CONVERT_HINTS[extOf(f.name)]).find(Boolean);
+        showReport({
+          kind: 'error',
+          title: files.length > 1 ? 'None of these files is a model this viewer opens' : `${quoted(names[0])} isn’t a model this viewer opens`,
+          body: `You ${how}: ${listOf(names.slice(0, 6))}${names.length > 6 ? ` and ${names.length - 6} more` : ''}.`,
+          fix: hint || 'Supported formats: .glb, .gltf (with its .bin and textures), .obj, .stl and .fbx. Convert other formats to .glb first. Blender can import most formats and export glTF.',
+        });
+        return;
+      }
+      const blobs = new Map(files.map((f) => [f.name, URL.createObjectURL(f)]));
+      const manager = new THREE.LoadingManager();
+      manager.setURLModifier((url) => {
+        if (url.startsWith('blob:') || url.startsWith('data:') || url.startsWith('http')) return url;
+        return blobs.get(baseName(url)) || url;
+      });
+      loadModel(blobs.get(main.name), main.name, manager, { local: true, blobs, size: main.size, files, restored: how === 'restored' })
+        .finally(() => setTimeout(() => blobs.forEach((u) => URL.revokeObjectURL(u)), 1000));
+    }
+
+    // --- Last model: the files opened from disk are kept in IndexedDB
+    //     (localStorage is too small for models) so a reload reopens them.
+    //     Storage can be unavailable (private windows, blocked site data),
+    //     so every call fails quietly and the tool simply starts empty. ---
+    const LAST_MODEL_DB = 'frameshot';
+    const LAST_MODEL_STORE = 'last-model';
+    function openLastModelDb() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(LAST_MODEL_DB, 1);
+        req.onupgradeneeded = () => req.result.createObjectStore(LAST_MODEL_STORE);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+    async function lastModelTx(mode, fn) {
+      const db = await openLastModelDb();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(LAST_MODEL_STORE, mode);
+        const req = fn(tx.objectStore(LAST_MODEL_STORE));
+        tx.oncomplete = () => { db.close(); resolve(req && req.result); };
+        tx.onerror = tx.onabort = () => { db.close(); reject(tx.error); };
+      });
+    }
+    async function rememberLastModel(files) {
+      try {
+        await lastModelTx('readwrite', (st) => st.put(files.map((f) => ({ name: f.name, type: f.type, blob: f })), 'files'));
+      } catch (e) {
+        console.warn('Could not keep the model for next time:', e);
+        showToast(e && e.name === 'QuotaExceededError'
+          ? 'Browser storage is full, so this model won’t reopen after a reload'
+          : 'This browser won’t let the model be kept, so it won’t reopen after a reload');
+      }
+    }
+    async function recallLastModel() {
+      try {
+        const rec = await lastModelTx('readonly', (st) => st.get('files'));
+        return rec && rec.length ? rec.map((r) => new File([r.blob], r.name, { type: r.type })) : null;
+      } catch (e) {
+        console.warn('Could not read the last model:', e);
+        return null;
+      }
+    }
+    async function forgetLastModel() {
+      try { await lastModelTx('readwrite', (st) => st.delete('files')); } catch (e) { /* nothing to forget */ }
+    }
+
+    // --- Load report: a persistent panel for errors and warnings ---
+    const reportEl = document.getElementById('report');
+    // primary: { text, run } for the solid button. Errors offer "Open another file".
+    let reportPrimary = null;
+    // onClose runs when the user cancels (Cancel/Dismiss or Escape).
+    let reportOnClose = null;
+    function showReport({ kind, label, title, body, fix, facts, raw, offerOpen = kind === 'error', primary, closeText = 'Dismiss', onClose }) {
+      reportPrimary = primary || (offerOpen ? { text: 'Open another file', run: openPicker } : null);
+      reportOnClose = onClose || null;
+      document.getElementById('report-progress').hidden = kind !== 'progress';
+      reportEl.dataset.kind = kind;
+      document.getElementById('report-kind').textContent =
+        label || (kind === 'error' ? 'Couldn’t open model' : 'Opened with problems');
+      document.getElementById('report-title').textContent = title;
+      document.getElementById('report-body').textContent = body || '';
+      document.getElementById('report-fix').textContent = fix || '';
+      document.getElementById('report-fix-row').hidden = !fix;
+      const dl = document.getElementById('report-facts');
+      dl.innerHTML = '';
+      for (const [k, v] of Object.entries(facts || {})) {
+        const dt = document.createElement('dt'); dt.textContent = k;
+        const dd = document.createElement('dd'); dd.textContent = v;
+        dl.append(dt, dd);
+      }
+      dl.hidden = !dl.children.length;
+      document.getElementById('report-raw').textContent = raw ? 'Technical detail: ' + raw : '';
+      const primaryBtn = document.getElementById('report-primary');
+      primaryBtn.hidden = !reportPrimary;
+      primaryBtn.textContent = reportPrimary ? reportPrimary.text : '';
+      document.getElementById('report-close').textContent = closeText;
+      document.getElementById('report-kind').hidden = !document.getElementById('report-kind').textContent;
+      reportEl.hidden = false;
+      document.body.classList.add('report-open');
+      (reportPrimary && kind === 'confirm' ? primaryBtn : document.getElementById('report-close')).focus();
+    }
+    function hideReport() {
+      reportEl.hidden = true;
+      reportOnClose = null;
+      document.body.classList.remove('report-open');
+    }
+    function cancelReport() {
+      const onClose = reportOnClose;
+      if (onClose) {
+        // Leave the panel up until the owner finishes cancelling.
+        reportOnClose = null;
+        document.getElementById('report-title').textContent = 'Cancelling…';
+        onClose();
+        return;
+      }
+      hideReport();
+    }
+    function setReportProgress(frac) {
+      document.getElementById('report-progress-bar').style.width = (frac * 100).toFixed(1) + '%';
+    }
+    document.getElementById('report-close').addEventListener('click', cancelReport);
+    document.getElementById('report-primary').addEventListener('click', () => {
+      const action = reportPrimary;
+      hideReport();
+      if (action) action.run();
+    });
+    window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !reportEl.hidden) cancelReport(); });
+
+    const fileModel = document.getElementById('file-model');
+    const openPicker = () => fileModel.click();
+
+    // Replacing a loaded model asks first. Views are saved per file name, so
+    // they aren't lost, but the current framing, unsaved lighting and the
+    // open model are.
+    function confirmReplace(proceed, primaryText) {
+      if (!model) { proceed(); return; }
+      showReport({
+        kind: 'confirm',
+        label: 'Open new model',
+        title: `Close ${quoted(modelName)} and open a new model?`,
+        body: 'The current model, camera position and any lighting not captured in a view will be cleared. '
+          + `Captured views are kept in this browser and come back when you open ${quoted(modelName)} again.`,
+        primary: { text: primaryText, run: proceed },
+        closeText: 'Cancel',
+      });
+    }
+    document.getElementById('btn-open').addEventListener('click', () => confirmReplace(openPicker, 'Choose a file'));
+    document.getElementById('dp-open').addEventListener('click', openPicker);
+    fileModel.addEventListener('change', () => {
+      if (fileModel.files.length) loadFiles(fileModel.files, 'selected');
+      fileModel.value = '';
+    });
+
+    // Drag & drop anywhere. Ignore internal drags (view reordering).
+    let fileDragDepth = 0;
+    const isFileDrag = (e) => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+    window.addEventListener('dragenter', (e) => {
+      if (!isFileDrag(e)) return;
+      fileDragDepth++;
+      document.body.classList.add('file-over');
+    });
+    window.addEventListener('dragleave', (e) => {
+      if (!isFileDrag(e)) return;
+      if (--fileDragDepth <= 0) { fileDragDepth = 0; document.body.classList.remove('file-over'); }
+    });
+    window.addEventListener('dragover', (e) => { if (isFileDrag(e)) e.preventDefault(); });
+    window.addEventListener('drop', (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      fileDragDepth = 0;
+      document.body.classList.remove('file-over');
+      const files = [...e.dataTransfer.files];
+      confirmReplace(() => loadFiles(files, 'dropped'), 'Open ' + (files.find((f) => MODEL_EXTS.includes(extOf(f.name)))?.name || 'files'));
+    });
+
+    // Center the model, drop it onto the ground, frame the camera.
+    function frameModel(obj) {
+      let box = new THREE.Box3().setFromObject(obj);
+      const rawMax = Math.max(...box.getSize(new THREE.Vector3()).toArray()) || 1;
+      obj.scale.multiplyScalar(MODEL_SIZE / rawMax);
+      obj.updateMatrixWorld(true);
+      box = new THREE.Box3().setFromObject(obj);
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+
+      obj.position.x -= center.x;
+      obj.position.z -= center.z;
+      obj.position.y -= box.min.y;
+
+      shadowGround.position.y = 0;
+
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const fitDist = (maxDim / 2) / Math.tan((camera.fov * Math.PI) / 360);
+      const dist = fitDist * 1.6;
+
+      const midY = size.y * 0.5;
+      controls.target.set(0, midY, 0);
+      camera.position.set(dist * 0.7, midY + maxDim * 0.35, dist);
+
+      camera.near = maxDim / 100;
+      camera.far = maxDim * 100;
+      camera.updateProjectionMatrix();
+
+      controls.minDistance = maxDim * 0.4;
+      controls.maxDistance = maxDim * 8;
+      controls.update();
+
+      homeState.pos.copy(camera.position);
+      homeState.target.copy(controls.target);
+    }
+
+    function makeGradientBackground(topHex, bottomHex) {
+      const c = document.createElement('canvas');
+      c.width = 2; c.height = 512;
+      const ctx = c.getContext('2d');
+      const grad = ctx.createLinearGradient(0, 0, 0, 512);
+      grad.addColorStop(0, topHex);
+      grad.addColorStop(1, bottomHex);
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, 2, 512);
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+
+    // ============================================================
+    //  Camera tween to an arbitrary view
+    // ============================================================
+    let tween = null;
+    function isTweening() { return tween !== null; }
+
+    function tweenTo(pos, target, light) {
+      tween = {
+        t: 0,
+        fromPos: camera.position.clone(),
+        fromTarget: controls.target.clone(),
+        toPos: pos.clone(),
+        toTarget: target.clone(),
+        fromLight: { ...liveLight },
+        toLight: light ? { ...liveLight, ...light } : { ...liveLight },
+      };
+    }
+
+    // ============================================================
+    //  Sequence (tour) logic
+    // ============================================================
+    const sequenceEl = document.getElementById('sequence');
+    const ovSlots = {
+      top: document.getElementById('ov-top'),
+      bottom: document.getElementById('ov-bottom'),
+      left: document.getElementById('ov-left'),
+      right: document.getElementById('ov-right'),
+      statement: document.getElementById('ov-statement'),
+      statementTop: document.getElementById('ov-sttop'),
+      statementBottom: document.getElementById('ov-stbottom'),
+      statementLeft: document.getElementById('ov-stleft'),
+      statementRight: document.getElementById('ov-stright'),
+    };
+    const OV_KEYS = Object.keys(ovSlots);
+    const seqReopen = document.getElementById('seq-reopen');
+
+    seqReopen.addEventListener('click', () => document.body.classList.remove('seq-collapsed'));
+
+    function hideTitleSlots() {
+      for (const k of OV_KEYS) ovSlots[k].classList.remove('visible');
+    }
+
+    // Resolve a view's effective pose/light/title, applying its portrait
+    // override when the frame is portrait-shaped.
+    function resolveView(s) {
+      const pv = (isPortrait() && s.portrait) ? s.portrait : null;
+      return {
+        pos: (pv && pv.pos) || s.pos,
+        target: (pv && pv.target) || s.target,
+        light: (pv && pv.light) ? { ...lightForState(s), ...pv.light } : lightForState(s),
+        title: (pv && pv.title) ? pv.title : s.title,
+        titlePos: (pv && pv.titlePos) ? pv.titlePos : s.titlePos,
+        titleLayer: (pv && pv.titleLayer) ? pv.titleLayer : s.titleLayer,
+      };
+    }
+
+    // Reveal the active view's title overlays (if it has any).
+    function revealOverlays() {
+      const s = states[activeIndex];
+      if (!s) return;
+      playSfx(AUDIO_SRC.tick, 0.35);
+      const rv = resolveView(s);
+      const title = rv.title;
+      if (title) {
+        for (const k of OV_KEYS) {
+          const txt = title[k];
+          ovSlots[k].textContent = txt || '';
+          ovSlots[k].classList.toggle('visible', !!txt);
+          const front = rv.titleLayer && Object.prototype.hasOwnProperty.call(rv.titleLayer, k)
+            ? rv.titleLayer[k]
+            : k !== 'left' && k !== 'right';
+          ovSlots[k].classList.toggle('behind', !front);
+          ovSlots[k].classList.toggle('in-front', !!front);
+        }
+      } else {
+        hideTitleSlots();
+      }
+      applyTitlePositions(rv.titlePos || {});
+    }
+
+    // Apply per-view manual text positions (or clear to the CSS default).
+    function applyTitlePositions(tp) {
+      for (const k of OV_KEYS) {
+        const el = ovSlots[k];
+        const p = tp[k];
+        if (p) {
+          el.style.left = p.x + '%';
+          el.style.top = p.y + '%';
+          el.style.right = 'auto';
+          el.style.bottom = 'auto';
+          el.style.transform = 'translate(-50%, -50%)';
+        } else {
+          el.style.left = '';
+          el.style.top = '';
+          el.style.right = '';
+          el.style.bottom = '';
+          el.style.transform = '';
+        }
+      }
+    }
+
+    // --- Title text authoring: drag to move, double-click to edit ---
+    function setTitleText(i, slot, text) {
+      const s = states[i];
+      if (isPortrait()) {
+        s.portrait = s.portrait || {};
+        if (!s.portrait.title) s.portrait.title = { ...resolveView(s).title };
+        s.portrait.title[slot] = text;
+      } else {
+        s.title = s.title || {};
+        s.title[slot] = text;
+      }
+    }
+    function setTitlePos(i, slot, x, y) {
+      const s = states[i];
+      const holder = isPortrait() ? (s.portrait = s.portrait || {}) : s;
+      holder.titlePos = holder.titlePos || {};
+      holder.titlePos[slot] = { x: round(x), y: round(y) };
+    }
+    function setTitleLayer(i, slot, front) {
+      const s = states[i];
+      const holder = isPortrait() ? (s.portrait = s.portrait || {}) : s;
+      holder.titleLayer = holder.titleLayer || {};
+      holder.titleLayer[slot] = front;
+    }
+    function startTitleDrag(slot, el, e0) {
+      const rect = stageEl.getBoundingClientRect();
+      const sx = e0.clientX, sy = e0.clientY;
+      let dragging = false, cur = null;
+      const move = (e) => {
+        if (!dragging && Math.hypot(e.clientX - sx, e.clientY - sy) < 4) return;
+        dragging = true;
+        e.preventDefault();
+        const x = ((e.clientX - rect.left) / rect.width) * 100;
+        const y = ((e.clientY - rect.top) / rect.height) * 100;
+        el.style.left = x + '%';
+        el.style.top = y + '%';
+        el.style.right = 'auto';
+        el.style.bottom = 'auto';
+        el.style.transform = 'translate(-50%, -50%)';
+        cur = { x, y };
+      };
+      const up = () => {
+        window.removeEventListener('mousemove', move);
+        window.removeEventListener('mouseup', up);
+        if (dragging && cur && activeIndex >= 0) {
+          setTitlePos(activeIndex, slot, cur.x, cur.y);
+          saveStates();
+          showToast('Text moved');
+        }
+      };
+      window.addEventListener('mousemove', move);
+      window.addEventListener('mouseup', up);
+    }
+
+    for (const [slot, el] of Object.entries(ovSlots)) {
+      el.addEventListener('mousedown', (e) => {
+        if (!document.body.classList.contains('textedit')) return;
+        if (el.isContentEditable) return;
+        startTitleDrag(slot, el, e);
+      });
+      el.addEventListener('dblclick', () => {
+        if (!document.body.classList.contains('textedit')) return;
+        el.contentEditable = 'true';
+        el.classList.add('editing');
+        el.focus();
+      });
+      el.addEventListener('input', () => {
+        if (activeIndex < 0) return;
+        setTitleText(activeIndex, slot, el.textContent);
+        saveStates();
+      });
+      el.addEventListener('blur', () => {
+        if (el.classList.contains('editing')) {
+          el.contentEditable = 'false';
+          el.classList.remove('editing');
+        }
+      });
+    }
+
+    const apTextEdit = document.getElementById('ap-textedit');
+    const apTextSlots = document.getElementById('ap-text-slots');
+    const SLOT_LABELS = {
+      top: 'Top', bottom: 'Bottom', left: 'Left', right: 'Right',
+      statement: 'Statement', statementTop: 'Top line', statementBottom: 'Bottom line',
+      statementLeft: 'Left line', statementRight: 'Right line',
+    };
+
+    function renderTextSlots() {
+      apTextSlots.innerHTML = '';
+      const active = activeIndex >= 0 ? states[activeIndex] : null;
+      const view = active ? resolveView(active) : null;
+      for (const slot of OV_KEYS) {
+        const row = document.createElement('div');
+        row.className = 'ap-text-slot';
+        const label = document.createElement('label');
+        label.textContent = SLOT_LABELS[slot];
+        label.htmlFor = 'slot-' + slot;
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.id = 'slot-' + slot;
+        input.value = view?.title?.[slot] || '';
+        input.disabled = !active;
+        const layer = document.createElement('button');
+        const front = view?.titleLayer && Object.prototype.hasOwnProperty.call(view.titleLayer, slot)
+          ? view.titleLayer[slot]
+          : slot !== 'left' && slot !== 'right';
+        layer.type = 'button';
+        layer.className = 'btn small';
+        layer.textContent = front ? 'Front' : 'Behind';
+        layer.classList.toggle('is-front', front);
+        layer.disabled = !active;
+        input.addEventListener('input', () => {
+          if (!active) return;
+          setTitleText(activeIndex, slot, input.value);
+          ovSlots[slot].textContent = input.value;
+          ovSlots[slot].classList.toggle('visible', !!input.value);
+          saveStates();
+        });
+        layer.addEventListener('click', () => {
+          if (!active) return;
+          const next = !layer.classList.contains('is-front');
+          setTitleLayer(activeIndex, slot, next);
+          layer.classList.toggle('is-front', next);
+          layer.textContent = next ? 'Front' : 'Behind';
+          ovSlots[slot].classList.toggle('behind', !next);
+          ovSlots[slot].classList.toggle('in-front', next);
+          saveStates();
+        });
+        row.append(label, input, layer);
+        apTextSlots.appendChild(row);
+      }
+    }
+
+    apTextEdit.addEventListener('click', () => {
+      const on = document.body.classList.toggle('textedit');
+      apTextEdit.classList.toggle('active', on);
+      showToast(on ? 'Drag a caption to move it. Double-click to edit its text.' : 'Caption placement off');
+    });
+
+    function hideOverlays() {
+      hideTitleSlots();
+    }
+
+    function renderSequence() {
+      sequenceEl.innerHTML = '';
+
+      const label = document.createElement('div');
+      label.className = 'seq-head';
+      const labelText = document.createElement('span');
+      labelText.className = 'label';
+      labelText.textContent = 'Views';
+      const collapseBtn = document.createElement('button');
+      collapseBtn.type = 'button';
+      collapseBtn.className = 'btn small';
+      collapseBtn.textContent = 'Hide';
+      collapseBtn.addEventListener('click', () => document.body.classList.add('seq-collapsed'));
+      label.appendChild(labelText);
+      label.appendChild(collapseBtn);
+      sequenceEl.appendChild(label);
+
+      if (states.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'seq-empty';
+        const msg = document.createElement('p');
+        const authoring = document.body.classList.contains('authoring');
+        msg.textContent = authoring
+          ? 'Frame the model, then press Capture new to add it to the sequence.'
+          : 'Open Author to start building a sequence.';
+        empty.appendChild(msg);
+        if (!authoring) {
+          const open = document.createElement('button');
+          open.type = 'button';
+          open.className = 'btn outline';
+          open.textContent = 'Open Author';
+          open.addEventListener('click', () => btnAuthor.click());
+          empty.appendChild(open);
+        }
+        sequenceEl.appendChild(empty);
+      }
+
+
+      states.forEach((s, i) => {
+        const item = document.createElement('div');
+        item.className = 'seq-item' + (i === activeIndex ? ' active' : '');
+
+        const idx = document.createElement('div');
+        idx.className = 'idx';
+        idx.textContent = i + 1;
+
+        const cap = document.createElement('div');
+        cap.className = 'cap';
+        cap.textContent = s.caption;
+
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'del';
+        del.textContent = '×';
+        del.setAttribute('aria-label', 'Delete view ' + (i + 1));
+        del.addEventListener('click', (e) => {
+          e.stopPropagation();
+          states.splice(i, 1);
+          if (activeIndex === i) clearActive();
+          else if (activeIndex > i) activeIndex--;
+          saveStates();
+          renderSequence();
+        });
+
+        item.appendChild(idx);
+        item.appendChild(cap);
+        item.appendChild(del);
+        item.addEventListener('click', () => { stopPlay(); goToState(i); });
+
+        // --- Drag to reorder ---
+        item.draggable = true;
+        item.addEventListener('dragstart', (e) => {
+          dragIndex = i;
+          item.classList.add('dragging');
+          e.dataTransfer.effectAllowed = 'move';
+        });
+        item.addEventListener('dragend', () => {
+          dragIndex = null;
+          clearDropMarkers();
+          item.classList.remove('dragging');
+        });
+        item.addEventListener('dragover', (e) => {
+          if (dragIndex === null) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+          const rect = item.getBoundingClientRect();
+          const after = (e.clientY - rect.top) > rect.height / 2;
+          clearDropMarkers();
+          item.classList.add(after ? 'drop-after' : 'drop-before');
+        });
+        item.addEventListener('dragleave', () => {
+          item.classList.remove('drop-before', 'drop-after');
+        });
+        item.addEventListener('drop', (e) => {
+          e.preventDefault();
+          if (dragIndex === null || dragIndex === i) { clearDropMarkers(); return; }
+          const rect = item.getBoundingClientRect();
+          const after = (e.clientY - rect.top) > rect.height / 2;
+          let desired = after ? i + 1 : i;
+          if (dragIndex < desired) desired--;
+          moveState(dragIndex, desired);
+        });
+
+        sequenceEl.appendChild(item);
+      });
+    }
+
+    function goToState(i) {
+      if (exporting) return;
+      if (i < 0 || i >= states.length) return;
+      const s = states[i];
+      activeIndex = i;
+      controls.autoRotate = false;
+      btnRotate.classList.remove('active');
+      hideOverlays();
+      const v = resolveView(s);
+      tweenTo(
+        new THREE.Vector3(v.pos[0], v.pos[1], v.pos[2]),
+        new THREE.Vector3(v.target[0], v.target[1], v.target[2]),
+        v.light
+      );
+      playSfx(AUDIO_SRC.whoosh, 0.5);
+      renderSequence();
+      renderTextSlots();
+    }
+
+    function clearActive() {
+      activeIndex = -1;
+      hideOverlays();
+      renderSequence();
+      renderTextSlots();
+      if (document.body.classList.contains('authoring')) syncLightSliders();
+    }
+
+    function stepState(dir) {
+      if (states.length === 0) return;
+      stopPlay();
+      let next = activeIndex + dir;
+      if (next < 0) next = states.length - 1;
+      if (next >= states.length) next = 0;
+      goToState(next);
+    }
+
+    // --- Drag reorder ---
+    let dragIndex = null;
+    function clearDropMarkers() {
+      sequenceEl.querySelectorAll('.seq-item').forEach((el) =>
+        el.classList.remove('drop-before', 'drop-after'));
+    }
+    function moveState(from, to) {
+      const activeState = activeIndex >= 0 ? states[activeIndex] : null;
+      const [moved] = states.splice(from, 1);
+      states.splice(to, 0, moved);
+      activeIndex = activeState ? states.indexOf(activeState) : -1;
+      saveStates();
+      renderSequence();
+    }
+
+    // --- Play (auto-advance through all views) ---
+    // The dwell timer starts when the camera ARRIVES at a view (scheduled
+    // from the tween-complete handler in the render loop), not when it
+    // departs — so every caption gets its full hold regardless of how long
+    // the move took, and no view is ever skipped.
+    const PLAY_DWELL_MS = 3000;
+    let playing = false;
+    let playTimer = null;
+    let playIdx = 0;
+
+    function startPlay() {
+      if (states.length === 0) return;
+      playing = true;
+      controls.autoRotate = false;
+      btnRotate.classList.remove('active');
+      btnPlay.classList.add('active');
+      btnPlay.textContent = 'Stop';
+      startBed();
+      playIdx = 0;
+      playStep();
+    }
+    function playStep() {
+      if (!playing) return;
+      goToState(playIdx); // dwell is scheduled once the camera settles
+    }
+    // Called from the render loop when a Play move finishes settling.
+    function scheduleNextPlayStep() {
+      clearTimeout(playTimer);
+      playTimer = setTimeout(() => {
+        if (!playing) return;
+        playIdx++;
+        if (playIdx >= states.length) { stopPlay(); return; }
+        playStep();
+      }, PLAY_DWELL_MS);
+    }
+    function stopPlay() {
+      if (!playing) return;
+      playing = false;
+      clearTimeout(playTimer);
+      stopBed();
+      btnPlay.classList.remove('active');
+      btnPlay.textContent = 'Play';
+    }
+
+    // ============================================================
+    //  Author mode
+    // ============================================================
+    const btnAuthor = document.getElementById('btn-author');
+    const apCaption = document.getElementById('ap-caption');
+    const apCapture = document.getElementById('ap-capture');
+    const apUpdate = document.getElementById('ap-update');
+    const apExport = document.getElementById('ap-export');
+    const apClear = document.getElementById('ap-clear');
+
+    btnAuthor.addEventListener('click', () => {
+      const on = document.body.classList.toggle('authoring');
+      btnAuthor.classList.toggle('active', on);
+      if (on) { syncLightSliders(); updateVpBadge(); renderTextSlots(); }
+      renderSequence();
+    });
+
+    const btnPhone = document.getElementById('btn-phone');
+    btnPhone.addEventListener('click', () => {
+      const on = document.body.classList.toggle('phone');
+      btnPhone.classList.toggle('active', on);
+    });
+
+    function currentView() {
+      return {
+        pos: [round(camera.position.x), round(camera.position.y), round(camera.position.z)],
+        target: [round(controls.target.x), round(controls.target.y), round(controls.target.z)],
+      };
+    }
+    function round(n) { return Math.round(n * 1000) / 1000; }
+
+    apCapture.addEventListener('click', () => {
+      if (!model) { showToast('Load a model first'); return; }
+      const caption = apCaption.value.trim() || `View ${states.length + 1}`;
+      const v = currentView();
+      const st = { caption, pos: v.pos, target: v.target };
+      const ls = lightSnapshot();
+      if (ls) st.light = ls;
+      states.push(st);
+      activeIndex = states.length - 1;
+      apCaption.value = '';
+      saveStates();
+      renderSequence();
+      renderTextSlots();
+      syncLightSliders();
+      showToast('View captured');
+    });
+
+    apUpdate.addEventListener('click', () => {
+      if (activeIndex < 0) { showToast('Select a view to update first'); return; }
+      const v = currentView();
+      const ls = lightSnapshot();
+      if (isPortrait()) {
+        // Write a portrait-only override; leave the landscape pose untouched.
+        const p = states[activeIndex].portrait || (states[activeIndex].portrait = {});
+        p.pos = v.pos;
+        p.target = v.target;
+        if (ls) p.light = ls; else delete p.light;
+        saveStates();
+        renderSequence();
+        showToast('Portrait view updated');
+        return;
+      }
+      states[activeIndex].pos = v.pos;
+      states[activeIndex].target = v.target;
+      if (apCaption.value.trim()) states[activeIndex].caption = apCaption.value.trim();
+      if (ls) states[activeIndex].light = ls;
+      else delete states[activeIndex].light;
+      saveStates();
+      renderSequence();
+      showToast('View updated');
+    });
+
+    apExport.addEventListener('click', async () => {
+      const json = JSON.stringify(states, null, 2);
+      downloadBlob(new Blob([json], { type: 'application/json' }), fileStem() + '-views.json');
+      try {
+        await navigator.clipboard.writeText(json);
+        showToast('Saved views JSON (also copied)');
+      } catch (e) {
+        showToast('Saved views JSON');
+      }
+    });
+
+    apClear.addEventListener('click', () => {
+      if (!modelName || !confirm('Delete all views for ' + modelName + '?')) return;
+      try { localStorage.removeItem(lsKey()); } catch (e) {}
+      states = [];
+      clearActive();
+      showToast('Views cleared');
+    });
+
+    const fileJson = document.getElementById('file-json');
+    document.getElementById('ap-import').addEventListener('click', () => {
+      if (!modelName) { showToast('Load a model first'); return; }
+      fileJson.click();
+    });
+    fileJson.addEventListener('change', async () => {
+      const f = fileJson.files[0];
+      fileJson.value = '';
+      if (!f) return;
+      const fail = (body, fix, raw) => showReport({
+        kind: 'error', label: 'Couldn’t import views', offerOpen: false,
+        title: `${quoted(f.name)} isn’t a views file`, body, fix, raw,
+        facts: { File: f.name, Size: fmtBytes(f.size), 'Current model': modelName },
+      });
+      let data;
+      try {
+        data = JSON.parse(await f.text());
+      } catch (e) {
+        fail('The file isn’t valid JSON, so it can’t be read.', 'Use a file saved with Export in Author mode.', e.message);
+        return;
+      }
+      if (!Array.isArray(data)) {
+        const keys = data && typeof data === 'object' ? Object.keys(data).slice(0, 5).join(', ') : typeof data;
+        fail(`A views file is a list of views, but this file holds ${data && typeof data === 'object' ? 'an object with the keys ' + keys : 'a ' + keys}.`,
+          'Use a file saved with Export in Author mode.');
+        return;
+      }
+      const bad = data.findIndex((v) => !v || !Array.isArray(v.pos) || v.pos.length !== 3 || !Array.isArray(v.target) || v.target.length !== 3);
+      if (bad >= 0) {
+        fail(`View ${bad + 1} of ${data.length} is missing its camera position or target (each needs “pos” and “target” as three numbers).`,
+          'Re-export the views, or fix that entry by hand.');
+        return;
+      }
+      states = data;
+      saveStates();
+      clearActive();
+      showToast(`Imported ${states.length} view${states.length === 1 ? '' : 's'}`);
+    });
+
+    // ============================================================
+    //  Lighting authoring (sliders)
+    // ============================================================
+    const LIGHT_META = {
+      exposure:     { label: 'Exposure',      min: 0.2,  max: 2.5, step: 0.05 },
+      keyIntensity: { label: 'Key intensity', min: 0,    max: 6,   step: 0.1 },
+      keyAzimuth:   { label: 'Key angle',     min: -180, max: 180, step: 1 },
+      keyElevation: { label: 'Key height',    min: 0,    max: 90,  step: 1 },
+      rimIntensity: { label: 'Rim / edge',    min: 0,    max: 5,   step: 0.1 },
+      ambient:      { label: 'Shadow fill',   min: 0,    max: 1,   step: 0.01 },
+    };
+
+    const apLights = document.getElementById('ap-lights');
+    const apLightTitle = document.getElementById('ap-light-title');
+    const apLightReset = document.getElementById('ap-light-reset');
+    const lightInputs = {};
+    const lightValEls = {};
+
+    function formatVal(k, v) {
+      if (k === 'keyAzimuth' || k === 'keyElevation') return Math.round(v) + '°';
+      return (Math.round(v * 100) / 100).toString();
+    }
+
+    for (const k of LIGHT_KEYS) {
+      const meta = LIGHT_META[k];
+      const row = document.createElement('div'); row.className = 'light-row';
+      const head = document.createElement('div'); head.className = 'lr-head';
+      const lab = document.createElement('span'); lab.textContent = meta.label;
+      const val = document.createElement('span'); val.className = 'lr-val';
+      head.appendChild(lab); head.appendChild(val);
+      const input = document.createElement('input');
+      input.type = 'range';
+      input.min = meta.min; input.max = meta.max; input.step = meta.step;
+      input.setAttribute('aria-label', meta.label);
+      input.addEventListener('input', () => {
+        const v = parseFloat(input.value);
+        liveLight[k] = v;
+        applyLight(liveLight);
+        val.textContent = formatVal(k, v);
+        if (activeIndex >= 0) {
+          states[activeIndex].light = { ...liveLight };
+          saveStates();
+        }
+      });
+      row.appendChild(head); row.appendChild(input);
+      apLights.appendChild(row);
+      lightInputs[k] = input;
+      lightValEls[k] = val;
+    }
+
+    function syncLightSliders() {
+      for (const k of LIGHT_KEYS) {
+        if (!lightInputs[k]) continue;
+        lightInputs[k].value = liveLight[k];
+        lightValEls[k].textContent = formatVal(k, liveLight[k]);
+      }
+      apLightTitle.textContent = activeIndex >= 0
+        ? `Lighting · view ${activeIndex + 1}`
+        : 'Lighting · default';
+    }
+    syncLightSliders();
+
+    function lightSnapshot() {
+      const differs = LIGHT_KEYS.some((k) => Math.abs(liveLight[k] - DEFAULT_LIGHT[k]) > 1e-6);
+      return differs ? { ...liveLight } : null;
+    }
+
+    apLightReset.addEventListener('click', () => {
+      Object.assign(liveLight, DEFAULT_LIGHT);
+      applyLight(liveLight);
+      if (activeIndex >= 0) { delete states[activeIndex].light; saveStates(); }
+      syncLightSliders();
+      showToast('Lighting reset to default');
+    });
+
+    // ============================================================
+    //  Frame shot — PNG of the current render, transparent background.
+    //  (HTML titles/captions are overlays and are not included.)
+    // ============================================================
+    function fileStem() {
+      return (modelName || 'frame').replace(/\.[^.]+$/, '').replace(/[^\w.-]+/g, '_');
+    }
+    function downloadBlob(blob, filename) {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }
+
+    document.getElementById('btn-shot').addEventListener('click', () => {
+      if (!model) { showToast('Load a model first'); return; }
+      const prev = renderer.getPixelRatio();
+      renderer.setPixelRatio(SHOT_PIXEL_RATIO);
+      renderer.setSize(renderW(), renderH(), false);
+      renderer.render(scene, camera);
+      // toBlob must run in the same task as render (no preserveDrawingBuffer)
+      const view = activeIndex >= 0 ? `-v${activeIndex + 1}` : '';
+      const name = `${fileStem()}${view}-${renderW() * SHOT_PIXEL_RATIO}x${renderH() * SHOT_PIXEL_RATIO}.png`;
+      renderer.domElement.toBlob((blob) => {
+        if (blob) { downloadBlob(blob, name); showToast('Saved ' + name); }
+      }, 'image/png');
+      renderer.setPixelRatio(prev);
+      renderer.setSize(renderW(), renderH(), false);
+    });
+
+    // ============================================================
+    //  Toast
+    // ============================================================
+    const toastEl = document.getElementById('toast');
+    let toastTimer = null;
+    function showToast(msg) {
+      toastEl.textContent = msg;
+      toastEl.classList.add('visible');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toastEl.classList.remove('visible'), 1800);
+    }
+
+    // ============================================================
+    //  Standard controls
+    // ============================================================
+    const btnPlay = document.getElementById('btn-play');
+    const btnRotate = document.getElementById('btn-rotate');
+    const btnReset = document.getElementById('btn-reset');
+    const btnWire = document.getElementById('btn-wire');
+
+    btnPlay.addEventListener('click', () => {
+      if (playing) stopPlay();
+      else startPlay();
+    });
+
+    // ============================================================
+    //  Audio — ambient bed (loops during Play) + transition SFX.
+    //  Muted by default; toggled by the Sound button. Drop files at:
+    //    audio/bed.mp3     — seamless dark ambient loop
+    //    audio/whoosh.mp3  — camera-move transition
+    //    audio/tick.mp3    — soft hit when a caption appears
+    //  Missing files fail silently — the toggle just won't make sound.
+    // ============================================================
+    const AUDIO_SRC = { bed: 'audio/bed.mp3', whoosh: 'audio/whoosh.mp3', tick: 'audio/tick.mp3' };
+    let audioOn = false;
+
+    const bedAudio = new Audio(AUDIO_SRC.bed);
+    bedAudio.loop = true;
+    bedAudio.volume = 0.45;
+    bedAudio.preload = 'metadata';
+    bedAudio.addEventListener('error', () => {}); // ignore a missing file
+    // Only offer Sound when there's a bed track to play.
+    bedAudio.addEventListener('loadedmetadata', () => { document.getElementById('btn-sound').hidden = false; });
+
+    function playSfx(src, vol) {
+      if (!audioOn) return;
+      try {
+        const a = new Audio(src);
+        a.volume = vol;
+        a.play().catch(() => {});
+      } catch (e) { /* ignore */ }
+    }
+    function startBed() { if (audioOn) bedAudio.play().catch(() => {}); }
+    function stopBed() { bedAudio.pause(); }
+
+    const btnSound = document.getElementById('btn-sound');
+    btnSound.addEventListener('click', () => {
+      audioOn = !audioOn;
+      btnSound.classList.toggle('active', audioOn);
+      if (audioOn) startBed();
+      else stopBed();
+    });
+
+    btnRotate.addEventListener('click', () => {
+      stopPlay();
+      controls.autoRotate = !controls.autoRotate;
+      btnRotate.classList.toggle('active', controls.autoRotate);
+      if (controls.autoRotate) clearActive();
+    });
+
+    btnReset.addEventListener('click', () => {
+      if (!model) return;
+      stopPlay();
+      controls.autoRotate = false;
+      btnRotate.classList.remove('active');
+      clearActive();
+      tweenTo(homeState.pos, homeState.target, { ...DEFAULT_LIGHT });
+    });
+
+    let wireOn = false;
+    btnWire.addEventListener('click', () => {
+      wireOn = !wireOn;
+      wireMeshes.forEach((m) => forEachMaterial(m, (mat) => { mat.wireframe = wireOn; }));
+      btnWire.classList.toggle('active', wireOn);
+    });
+
+    // Keyboard: arrows step through sequence
+    window.addEventListener('keydown', (e) => {
+      if (e.target.tagName === 'INPUT') return;
+      if (e.key === 'ArrowRight') { e.preventDefault(); stepState(1); }
+      else if (e.key === 'ArrowLeft') { e.preventDefault(); stepState(-1); }
+    });
+
+    // --- Resize (observe the stage so it also fires on phone-mode toggle) ---
+    function onStageResize() {
+      if (exporting) return; // the exporter owns the renderer size
+      camera.aspect = renderW() / renderH();
+      camera.updateProjectionMatrix();
+      renderer.setSize(renderW(), renderH());
+      const p = isPortrait();
+      if (p !== lastPortrait) {
+        lastPortrait = p;
+        updateVpBadge();
+        if (activeIndex >= 0) goToState(activeIndex); // re-frame for the new orientation
+      }
+    }
+    new ResizeObserver(onStageResize).observe(stageEl);
+
+    function updateVpBadge() {
+      const badge = document.getElementById('ap-vp');
+      if (badge) badge.textContent = isPortrait() ? 'Portrait' : 'Landscape';
+    }
+
+    // ============================================================
+    //  Export video — replays the sequence offline, frame by frame,
+    //  at a fixed frame rate (so it's smooth however slow the machine),
+    //  composites the caption overlays into each frame, and encodes
+    //  H.264 MP4 with WebCodecs + mp4-muxer.
+    //  Timing matches Play: camera move, captions fade in on arrival,
+    //  each view holds for PLAY_DWELL_MS from arrival.
+    // ============================================================
+    const VIDEO_FPS = 30;
+    const VIDEO_LONG_EDGE = 1920;
+    const VIDEO_BITRATE = 12_000_000;
+    const MOVE_S = 1 / 0.025 / 60;   // the live tween: 40 steps at 60 fps
+    const REVEAL_S = 0.7;            // --t-reveal
+    const MP4_MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.5/+esm';
+    let exporting = false;
+    let exportCancelled = false;
+
+    function isFrontSlot(rv, k) {
+      return rv.titleLayer && Object.prototype.hasOwnProperty.call(rv.titleLayer, k)
+        ? rv.titleLayer[k]
+        : k !== 'left' && k !== 'right';
+    }
+
+    // Lay a view's captions out in the real DOM (transitions off) and read
+    // back exactly where the browser puts every line, hidden and shown, so
+    // the video matches the live overlays.
+    function measureCaptions(rv) {
+      const stageRect = stageEl.getBoundingClientRect();
+      const slots = [];
+      document.body.classList.add('measuring');
+      applyTitlePositions(rv.titlePos || {});
+      for (const k of OV_KEYS) {
+        const txt = rv.title && rv.title[k];
+        if (!txt) continue;
+        const el = ovSlots[k];
+        el.textContent = txt;
+        el.classList.remove('visible');
+        const hiddenRect = el.getBoundingClientRect();
+        el.classList.add('visible');
+        const shownRect = el.getBoundingClientRect();
+        const cs = getComputedStyle(el);
+
+        // Split into the browser's own line breaks using word rects.
+        const node = el.firstChild;
+        const words = [...txt.matchAll(/\S+/g)];
+        const lines = [];
+        const range = document.createRange();
+        for (const w of words) {
+          range.setStart(node, w.index);
+          range.setEnd(node, w.index + w[0].length);
+          const r = range.getBoundingClientRect();
+          const last = lines[lines.length - 1];
+          if (last && Math.abs(r.top - last.top) < r.height / 2) {
+            last.end = w.index + w[0].length;
+            last.right = r.right;
+          } else {
+            lines.push({ start: w.index, end: w.index + w[0].length, left: r.left, top: r.top, right: r.right, height: r.height });
+          }
+        }
+        slots.push({
+          front: isFrontSlot(rv, k),
+          font: `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`,
+          fontSize: parseFloat(cs.fontSize),
+          letterSpacing: parseFloat(cs.letterSpacing) || 0,
+          color: cs.color,
+          dx: hiddenRect.left - shownRect.left,
+          dy: hiddenRect.top - shownRect.top,
+          lines: lines.map((l) => ({
+            text: txt.slice(l.start, l.end),
+            x: l.left - stageRect.left,
+            cy: l.top + l.height / 2 - stageRect.top,
+          })),
+        });
+        el.classList.remove('visible');
+        el.textContent = '';
+      }
+      document.body.classList.remove('measuring');
+      return slots;
+    }
+
+    function easeOutReveal(t) { return 1 - Math.pow(1 - t, 4); } // ≈ the --ease curve
+
+    // Draw caption slots (behind or in front of the model) at a reveal amount 0..1.
+    function drawCaptions(ctx, slots, amount, front, scale) {
+      if (!slots || amount <= 0) return;
+      const e = easeOutReveal(amount);
+      for (const s of slots) {
+        if (s.front !== front) continue;
+        ctx.save();
+        ctx.globalAlpha = e;
+        ctx.font = s.font.replace(/^(\S+) ([\d.]+)px/, (m, w, px) => `${w} ${px * scale}px`);
+        if ('letterSpacing' in ctx) ctx.letterSpacing = s.letterSpacing * scale + 'px';
+        ctx.fillStyle = s.color;
+        ctx.textBaseline = 'middle';
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.55)';
+        ctx.shadowBlur = 40 * scale;
+        ctx.shadowOffsetY = 4 * scale;
+        const ox = s.dx * (1 - e) * scale;
+        const oy = s.dy * (1 - e) * scale;
+        for (const l of s.lines) ctx.fillText(l.text, l.x * scale + ox, l.cy * scale + oy);
+        ctx.restore();
+      }
+    }
+
+    // The timeline: one segment per view (move, then hold from arrival).
+    function buildTimeline() {
+      const segs = [];
+      let t = 0;
+      states.forEach((s, i) => {
+        const rv = resolveView(s);
+        const move = i === 0 ? 0 : MOVE_S;
+        segs.push({
+          i, rv, start: t, move,
+          end: t + move + PLAY_DWELL_MS / 1000,
+          pos: new THREE.Vector3(...rv.pos),
+          target: new THREE.Vector3(...rv.target),
+          light: rv.light,
+          captions: measureCaptions(rv),
+        });
+        t = segs[segs.length - 1].end;
+      });
+      return { segs, duration: t };
+    }
+
+    function poseAt(timeline, t) {
+      const { segs } = timeline;
+      let k = segs.findIndex((s) => t < s.end);
+      if (k < 0) k = segs.length - 1;
+      const seg = segs[k];
+      const prev = segs[k - 1];
+      const local = t - seg.start;
+      const moving = prev && local < seg.move;
+      const m = moving ? easeInOutCubic(local / seg.move) : 1;
+      const pos = prev ? new THREE.Vector3().lerpVectors(prev.pos, seg.pos, m) : seg.pos.clone();
+      const target = prev ? new THREE.Vector3().lerpVectors(prev.target, seg.target, m) : seg.target.clone();
+      const light = {};
+      for (const key of LIGHT_KEYS) {
+        light[key] = prev ? prev.light[key] + (seg.light[key] - prev.light[key]) * m : seg.light[key];
+      }
+      // Captions: this view's fade in after arrival; the previous view's
+      // fade out while the camera leaves (as in the live Play).
+      const showIn = Math.max(0, Math.min(1, (local - seg.move) / REVEAL_S));
+      const showOut = prev ? Math.max(0, 1 - local / REVEAL_S) : 0;
+      return { pos, target, light, seg, prev, showIn, showOut };
+    }
+
+    function exportFacts(w, h, frames, seconds) {
+      return {
+        Views: String(states.length),
+        Size: `${w} × ${h}`,
+        Length: `${seconds.toFixed(1)} s (${frames} frames at ${VIDEO_FPS} fps)`,
+        Format: 'MP4, H.264, no audio',
+      };
+    }
+
+    async function pickVideoCodec(w, h) {
+      if (typeof VideoEncoder === 'undefined') return null;
+      for (const codec of ['avc1.640033', 'avc1.4d0033', 'avc1.42003e']) {
+        const cfg = { codec, width: w, height: h, bitrate: VIDEO_BITRATE, framerate: VIDEO_FPS };
+        try {
+          const { supported } = await VideoEncoder.isConfigSupported(cfg);
+          if (supported) return cfg;
+        } catch (e) { /* try the next profile */ }
+      }
+      return null;
+    }
+
+    async function exportVideo() {
+      if (exporting) return;
+      if (!model) return;
+      if (states.length === 0) {
+        showReport({
+          kind: 'error', label: 'Couldn’t export video', offerOpen: false,
+          title: 'There’s no sequence to export yet',
+          body: `Export video plays your captured views in order, like Play. ${quoted(modelName)} has no views yet.`,
+          fix: 'Open Author, frame the model and press Capture new for each shot, then export again.',
+          primary: { text: 'Open Author', run: () => { if (!document.body.classList.contains('authoring')) btnAuthor.click(); } },
+        });
+        return;
+      }
+
+      // Output keeps the stage's shape (landscape, portrait or phone frame).
+      const aspect = renderW() / renderH();
+      const even = (n) => Math.max(2, Math.round(n / 2) * 2);
+      const outW = aspect >= 1 ? VIDEO_LONG_EDGE : even(VIDEO_LONG_EDGE * aspect);
+      const outH = aspect >= 1 ? even(VIDEO_LONG_EDGE / aspect) : VIDEO_LONG_EDGE;
+
+      const config = await pickVideoCodec(outW, outH);
+      if (!config) {
+        showReport({
+          kind: 'error', label: 'Couldn’t export video', offerOpen: false,
+          title: typeof VideoEncoder === 'undefined'
+            ? 'This browser can’t encode video'
+            : `This browser can’t encode H.264 at ${outW} × ${outH}`,
+          body: typeof VideoEncoder === 'undefined'
+            ? 'Video export uses the WebCodecs API (VideoEncoder), which this browser doesn’t provide.'
+            : 'The browser’s video encoder rejected every H.264 profile tried (High, Main and Baseline) at this size.',
+          fix: 'Use a recent Chrome, Edge or Safari (16.4 or later). If you’re in Phone frame mode, try turning it off to export landscape.',
+          facts: { Size: `${outW} × ${outH}`, Browser: navigator.userAgent },
+        });
+        return;
+      }
+
+      let Muxer, ArrayBufferTarget;
+      try {
+        ({ Muxer, ArrayBufferTarget } = await import(MP4_MUXER_URL));
+      } catch (e) {
+        showReport({
+          kind: 'error', label: 'Couldn’t export video', offerOpen: false,
+          title: 'Couldn’t load the MP4 writer',
+          body: 'Video export downloads a small library (mp4-muxer) from cdn.jsdelivr.net to package the frames as MP4, and that download failed.',
+          fix: 'Check your internet connection, then try again.',
+          raw: String(e && e.message || e),
+        });
+        return;
+      }
+
+      stopPlay();
+      controls.autoRotate = false;
+      btnRotate.classList.remove('active');
+      const saved = {
+        pos: camera.position.clone(), target: controls.target.clone(),
+        light: { ...liveLight }, pixelRatio: renderer.getPixelRatio(), active: activeIndex,
+      };
+      hideOverlays();
+      tween = null;
+      exporting = true;
+      exportCancelled = false;
+      document.body.classList.add('exporting');
+      controls.enabled = false;
+
+      const timeline = buildTimeline();
+      const frames = Math.ceil(timeline.duration * VIDEO_FPS);
+      const facts = exportFacts(outW, outH, frames, timeline.duration);
+      const fileName = `${fileStem()}-sequence-${outW}x${outH}.mp4`;
+      showReport({
+        kind: 'progress', label: 'Exporting video', offerOpen: false,
+        title: 'Rendering frame 0 of ' + frames, facts, closeText: 'Cancel',
+        onClose: () => { exportCancelled = true; },
+      });
+      setReportProgress(0);
+
+      const comp = document.createElement('canvas');
+      comp.width = outW;
+      comp.height = outH;
+      const ctx = comp.getContext('2d');
+      const scale = outW / renderW();
+
+      renderer.setPixelRatio(1);
+      renderer.setSize(outW, outH, false);
+      camera.aspect = outW / outH;
+      camera.updateProjectionMatrix();
+
+      let encodeError = null;
+      const target = new ArrayBufferTarget();
+      const muxer = new Muxer({ target, video: { codec: 'avc', width: outW, height: outH, frameRate: VIDEO_FPS }, fastStart: 'in-memory' });
+      const encoder = new VideoEncoder({
+        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+        error: (e) => { encodeError = e; },
+      });
+      encoder.configure(config);
+
+      try {
+        for (let f = 0; f < frames; f++) {
+          if (exportCancelled) break;
+          if (encodeError) throw encodeError;
+          const p = poseAt(timeline, f / VIDEO_FPS);
+          camera.position.copy(p.pos);
+          camera.lookAt(p.target);
+          applyLight(p.light);
+
+          ctx.fillStyle = '#000';
+          ctx.fillRect(0, 0, outW, outH);
+          drawCaptions(ctx, p.prev && p.prev.captions, p.showOut, false, scale);
+          drawCaptions(ctx, p.seg.captions, p.showIn, false, scale);
+          renderer.render(scene, camera);
+          ctx.drawImage(renderer.domElement, 0, 0, outW, outH);
+          drawCaptions(ctx, p.prev && p.prev.captions, p.showOut, true, scale);
+          drawCaptions(ctx, p.seg.captions, p.showIn, true, scale);
+
+          const frame = new VideoFrame(comp, { timestamp: Math.round(f * 1e6 / VIDEO_FPS), duration: Math.round(1e6 / VIDEO_FPS) });
+          encoder.encode(frame, { keyFrame: f % (VIDEO_FPS * 2) === 0 });
+          frame.close();
+
+          // Keep the encoder queue short and let the progress panel paint.
+          while (encoder.encodeQueueSize > 8) await new Promise((r) => setTimeout(r, 0));
+          if (f % 3 === 0) {
+            document.getElementById('report-title').textContent = `Rendering frame ${f + 1} of ${frames}`;
+            setReportProgress((f + 1) / frames);
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        }
+        if (!exportCancelled) {
+          document.getElementById('report-title').textContent = 'Finishing the MP4 file';
+          await encoder.flush();
+          if (encodeError) throw encodeError;
+          muxer.finalize();
+          downloadBlob(new Blob([target.buffer], { type: 'video/mp4' }), fileName);
+        }
+        encoder.close();
+      } catch (e) {
+        console.error('Video export failed:', e);
+        try { encoder.close(); } catch (_) { /* already closed */ }
+        restoreAfterExport(saved);
+        showReport({
+          kind: 'error', label: 'Couldn’t export video', offerOpen: false,
+          title: 'The video encoder stopped partway through',
+          body: 'Frames were being rendered, but the browser’s video encoder reported an error and the file couldn’t be finished.',
+          fix: 'Try again. If it keeps failing, close other heavy tabs, or turn off Phone frame to export a standard landscape size.',
+          facts: { ...facts, Codec: config.codec },
+          raw: String(e && e.message || e),
+        });
+        return;
+      }
+
+      restoreAfterExport(saved);
+      hideReport();
+      showToast(exportCancelled ? 'Video export cancelled' : 'Saved ' + fileName);
+    }
+
+    function restoreAfterExport(saved) {
+      exporting = false;
+      document.body.classList.remove('exporting');
+      controls.enabled = true;
+      renderer.setPixelRatio(saved.pixelRatio);
+      // Re-apply the stage size: resizes during the export were skipped.
+      renderer.setSize(renderW(), renderH());
+      camera.aspect = renderW() / renderH();
+      camera.updateProjectionMatrix();
+      if (isPortrait() !== lastPortrait) { lastPortrait = isPortrait(); updateVpBadge(); }
+      camera.position.copy(saved.pos);
+      controls.target.copy(saved.target);
+      Object.assign(liveLight, saved.light);
+      applyLight(liveLight);
+      controls.update();
+      activeIndex = saved.active;
+      if (activeIndex >= 0) revealOverlays();
+    }
+
+    document.getElementById('btn-export-video').addEventListener('click', exportVideo);
+
+    // ============================================================
+    //  Render loop
+    // ============================================================
+    function tick() {
+      requestAnimationFrame(tick);
+      if (exporting) return; // the exporter drives the renderer
+
+      if (tween) {
+        tween.t = Math.min(tween.t + 0.025, 1);
+        const e = easeInOutCubic(tween.t);
+        camera.position.lerpVectors(tween.fromPos, tween.toPos, e);
+        controls.target.lerpVectors(tween.fromTarget, tween.toTarget, e);
+        for (const k of LIGHT_KEYS) {
+          liveLight[k] = tween.fromLight[k] + (tween.toLight[k] - tween.fromLight[k]) * e;
+        }
+        applyLight(liveLight);
+        if (tween.t >= 1) {
+          tween = null;
+          if (activeIndex >= 0) revealOverlays();
+          syncLightSliders();
+          if (playing) scheduleNextPlayStep();
+        }
+      }
+
+      controls.update();
+
+      renderer.render(scene, camera);
+    }
+
+    function easeInOutCubic(x) {
+      return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+    }
+
+    renderSequence();
+    tick();
+
+    // On start: ?model=path/to/file.glb loads a model served next to this
+    // page; otherwise reopen the last model that was opened from disk.
+    const initialModel = new URLSearchParams(location.search).get('model');
+    if (initialModel) {
+      loadModel(initialModel, baseName(initialModel));
+    } else {
+      loaderEl.classList.remove('idle');
+      loaderPct.textContent = 'Reopening your last model';
+      recallLastModel().then((files) => {
+        if (files) loadFiles(files, 'restored');
+        else loaderEl.classList.add('idle');
+      });
+    }
+  </script>
+</body>
+</html>

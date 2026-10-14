@@ -1,0 +1,11 @@
+# Model files stay local (some are proprietary samples)
+*.glb
+*.gltf
+*.bin
+*.obj
+*.stl
+*.fbx
+
+# Local tool settings
+.claude/
+.DS_Store
